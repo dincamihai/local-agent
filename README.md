@@ -2,6 +2,8 @@
 
 MCP bridge that lets Claude Code delegate tasks to a local [pi coding agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) running in Docker with [Ollama](https://ollama.com/) models (qwen3, gemma, phi4, deepseek-r1, etc.).
 
+Pairs with [board-tui](https://github.com/dincamihai/board-tui) — the `delegate` skill consumes `.tasks/*.md` cards, the agent updates them when done.
+
 ## Architecture
 
 ```
@@ -149,6 +151,44 @@ pi_result()
 
 # Stop when done
 pi_stop()
+```
+
+## Using with board-tui
+
+[board-tui](https://github.com/dincamihai/board-tui) is a Textual TUI kanban
+for `.tasks/*.md` markdown cards. local-agent's `delegate` skill is built to
+consume that format — one card is one delegation unit.
+
+End-to-end flow:
+
+1. **Create a task card** in `.tasks/<slug>.md` — via the board-tui UI, its
+   `board-tui-mcp` server, or by hand. Card has YAML frontmatter (`column`,
+   `order`) and a body with definition of done.
+2. **Invoke `/delegate`** in Claude Code. The skill:
+   - Moves the card to `In Progress`
+   - Calls `pi_start` with `workspace: <repo>` and `task: .tasks/<slug>.md`
+   - `pi_start` auto-creates a `pi/<slug>-<ts>` git worktree so agent edits
+     stay isolated from `main`
+3. **Agent works** in the container. `/task.md` is read-write, `/workspace`
+   is the worktree, `/context` is the repo read-only.
+4. **Agent finishes**: updates card frontmatter to `column: Done`, appends a
+   `## Result` section summarising what it did.
+5. **Claude calls `pi_merge`** — commits uncommitted edits, merges worktree
+   branch into `main`, removes worktree. Then `pi_stop` cleans up container.
+6. **board-tui refreshes** (`r`) and the card appears in `Done`.
+
+Register both MCP servers in Claude Code:
+
+```bash
+claude mcp add pi_bridge    -- npx tsx /path/to/local-agent/pi-bridge-mcp.ts
+claude mcp add board-local  -- board-tui-mcp
+```
+
+Symlink the Claude Code skills:
+
+```bash
+ln -s /path/to/board-tui/skills/task-cards ~/.claude/skills/task-cards
+ln -s /path/to/local-agent/skills/delegate ~/.claude/skills/delegate
 ```
 
 ## License
