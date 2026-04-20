@@ -1,0 +1,51 @@
+{
+  "providers": {
+    "ollama": {
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "baseUrl": "http://host.docker.internal:11434/v1",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "contextWindow": 131072,
+          "id": "qwen3.6:latest",
+          "input": ["text"],
+          "reasoning": true
+        },
+        {
+          "contextWindow": 131072,
+          "id": "qwen3:8b",
+          "input": ["text"],
+          "reasoning": true
+        },
+        {
+          "contextWindow": 131072,
+          "id": "gemma4:26b",
+          "input": ["text", "image"],
+          "reasoning": true
+        },
+        {
+          "contextWindow": 131072,
+          "id": "phi4:latest",
+          "input": ["text"],
+          "reasoning": false
+        },
+        {
+          "contextWindow": 131072,
+          "id": "deepseek-r1:7b",
+          "input": ["text"],
+          "reasoning": true
+        },
+        {
+          "contextWindow": 131072,
+          "id": "ministral-3:3b",
+          "input": ["text"],
+          "reasoning": false
+        }
+      ]
+    }
+  }
+}

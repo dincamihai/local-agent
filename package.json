@@ -1,0 +1,26 @@
+{
+  "name": "local-agent",
+  "version": "0.1.0",
+  "description": "MCP bridge that delegates coding tasks to a local LLM (ollama) running in a Docker container with read/write/bash tools and long-term memory.",
+  "main": "pi-bridge-mcp.ts",
+  "type": "module",
+  "scripts": {
+    "test": "tsx pi-bridge-mcp.test.ts"
+  },
+  "keywords": ["mcp", "llm", "ollama", "agent", "coding-agent", "claude"],
+  "author": "Mihai Dincă <dincamihai@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dincamihai/local-agent.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.0.0",
+    "typescript": "^6.0.3"
+  }
+}
