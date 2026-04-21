@@ -64,6 +64,28 @@ function releaseGlobalSlot(instanceId: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Repo name detection for worktree organization
+// ---------------------------------------------------------------------------
+
+function getRepoName(workspace: string): string {
+  try {
+    const remote = execSync(`git -C ${workspace} config --get remote.origin.url`, { encoding: "utf-8" }).trim();
+    // Parse repo name from SSH (git@github.com:user/repo.git) or HTTPS (https://github.com/user/repo.git)
+    const match = remote.match(/\/([^/]+?)(?:\.git)?$/);
+    if (match?.[1]) {
+      return sanitizeRepoName(match[1]);
+    }
+  } catch {
+    // Not a git repo or no remote configured
+  }
+  return sanitizeRepoName(basename(workspace));
+}
+
+function sanitizeRepoName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+// ---------------------------------------------------------------------------
 // Resource subscription tracking
 // ---------------------------------------------------------------------------
 
@@ -204,8 +226,9 @@ class PiRpcClient {
       let worktreePath: string | undefined;
       try {
         const branch = `pi/${name}-${Date.now()}`;
-        worktreePath = `/tmp/pi-worktrees/${branch.replace(/\//g, "-")}`;
-        execSync("mkdir -p /tmp/pi-worktrees");
+        const repoName = getRepoName(workDir);
+        worktreePath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
+        execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
         execSync(`git -C ${workDir} worktree add ${worktreePath} -b ${branch}`);
         this.worktreePath = worktreePath;
         this.worktreeWorkDir = workDir;

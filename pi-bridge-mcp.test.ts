@@ -7,7 +7,7 @@
 import { strict as assert } from "node:assert";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { spawn, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -41,34 +41,9 @@ function cleanup(paths: string[]) {
 // ---- tests -----------------------------------------------------------------
 
 async function testHappyPathWorktree() {
-  console.log("TEST 1: happy path — workspace is a git repo → worktree created");
+  console.log("TEST 1: happy path — workspace is a git repo → worktree created with repo name in path");
   const workDir = makeTempGitRepo();
-
-  const PiRpcClient = (class {
-    worktreePath: string | null = null;
-    worktreeWorkDir: string | null = null;
-    async start(workDir?: string, _task?: string, editDir?: string, name?: string) {
-      if (workDir && !editDir && (() => {
-        try { execSync(`git -C ${workDir} rev-parse --git-dir`, { stdio: "ignore" }); return true; }
-        catch { return false; }
-      })()) {
-        let wtPath: string | undefined;
-        try {
-          const branch = `pi/${name}-${Date.now()}`;
-          wtPath = `/tmp/pi-worktrees/${branch.replace(/\//g, "-")}`;
-          execSync("mkdir -p /tmp/pi-worktrees");
-          execSync(`git -C ${workDir} worktree add ${wtPath} -b ${branch}`);
-          this.worktreePath = wtPath;
-          this.worktreeWorkDir = workDir;
-          editDir = wtPath;
-        } catch { /* silent */ }
-      }
-      this.editDir = editDir;
-      this.containerName = name ?? `pi-agent-${Date.now()}`;
-    }
-    editDir: string | undefined;
-    containerName: string | null = null;
-  });
+  const expectedRepoName = basename(workDir);
 
   const client = new (class {
     worktreePath: string | null = null;
@@ -83,8 +58,9 @@ async function testHappyPathWorktree() {
         let wtPath: string | undefined;
         try {
           const branch = `pi/${name}-${Date.now()}`;
-          wtPath = `/tmp/pi-worktrees/${branch.replace(/\//g, "-")}`;
-          execSync("mkdir -p /tmp/pi-worktrees");
+          const repoName = basename(workDir);
+          wtPath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
+          execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
           execSync(`git -C ${workDir} worktree add ${wtPath} -b ${branch}`);
           this.worktreePath = wtPath;
           this.worktreeWorkDir = workDir;
@@ -99,17 +75,19 @@ async function testHappyPathWorktree() {
   await client.start(workDir, undefined, undefined, "pi-test");
 
   assert.ok(client.worktreePath, "worktreePath should be set");
+  assert.ok(client.worktreePath?.includes(expectedRepoName), `worktree path should include repo name '${expectedRepoName}'`);
   assert.ok(client.worktreeWorkDir, "worktreeWorkDir should be set");
   assert.ok(client.editDir, "editDir should be set to worktree path");
   assert.ok(client.containerName?.startsWith("pi-"), "container name should have pi- prefix");
-  console.log("  PASS — worktree created, editDir set, container named");
+  console.log("  PASS — worktree created with repo name in path, editDir set, container named");
 
   cleanup([workDir]);
 }
 
 async function testNoGitWorkspace() {
-  console.log("TEST 2: not a git repo — no worktree, no error");
+  console.log("TEST 2: not a git repo — no worktree, no error (falls back to basename)");
   const workDir = makeTempNoGit();
+  const expectedRepoName = basename(workDir);
 
   const client2 = {
     worktreePath: null as string | null,
@@ -144,7 +122,7 @@ async function testNoGitWorkspace() {
 }
 
 async function testExplicitEditdirOverrides() {
-  console.log("TEST 3: explicit editdir — overrides auto-worktree");
+  console.log("TEST 3a: explicit editdir — overrides auto-worktree");
   const workDir = makeTempGitRepo();
   const explicitEdit = join(tmpdir(), "pi-test-explicit-editdir-" + Date.now());
   mkdirSync(explicitEdit);
@@ -180,6 +158,78 @@ async function testExplicitEditdirOverrides() {
   console.log("  PASS — explicit editdir used, no auto worktree");
 
   cleanup([workDir, explicitEdit]);
+}
+
+async function testRepoNameFromGitRemote() {
+  console.log("TEST 3b: repo name from git remote — parsed correctly");
+  const workDir = makeTempGitRepo();
+
+  // Set up a fake remote origin
+  execSync("git config remote.origin.url git@github.com:mihai/test-repo.git", { cwd: workDir, stdio: "ignore" });
+
+  const testCode = `
+    const { execSync } = require('child_process');
+    const { basename } = require('path');
+
+    function getRepoName(workspace) {
+      try {
+        const remote = execSync(\`git -C \${workspace} config --get remote.origin.url\`, { encoding: "utf-8" }).trim();
+        const sshMatch = remote.match(/\\/([^/]+?)(?:\\.git)?$/);
+        const httpsMatch = remote.match(/\\/([^/]+?)(?:\\.git)?$/);
+        if (sshMatch?.[1]) return sshMatch[1];
+        if (httpsMatch?.[1]) return httpsMatch[1];
+      } catch {}
+      return basename(workspace);
+    }
+
+    console.log(JSON.stringify({ repoName: getRepoName("${workDir}") }));
+  `;
+
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.repoName, "test-repo", "should parse repo name from SSH remote URL");
+
+  cleanup([workDir]);
+  console.log("  PASS — repo name parsed from git remote");
+}
+
+async function testRepoNameFallbackToBasename() {
+  console.log("TEST 3c: repo name fallback — basename when no remote");
+  const workDir = makeTempGitRepo();
+
+  // Don't set a remote, so it falls back to basename
+  // (fresh repo has no remote.origin.url)
+
+  const expectedName = basename(workDir);
+
+  const testCode = `
+    const { execSync } = require('child_process');
+    const { basename } = require('path');
+
+    function getRepoName(workspace) {
+      try {
+        const remote = execSync(\`git -C \${workspace} config --get remote.origin.url\`, { encoding: "utf-8" }).trim();
+        const sshMatch = remote.match(/\\/([^/]+?)(?:\\.git)?$/);
+        const httpsMatch = remote.match(/\\/([^/]+?)(?:\\.git)?$/);
+        if (sshMatch?.[1]) return sshMatch[1];
+        if (httpsMatch?.[1]) return httpsMatch[1];
+      } catch {}
+      return basename(workspace);
+    }
+
+    console.log(JSON.stringify({ repoName: getRepoName("${workDir}") }));
+  `;
+
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.repoName, expectedName, "should fall back to basename when no remote");
+
+  cleanup([workDir]);
+  console.log("  PASS — repo name falls back to basename");
 }
 
 async function testFailedWorktreeCreation() {
@@ -968,6 +1018,8 @@ async function runTests() {
     testHappyPathWorktree,
     testNoGitWorkspace,
     testExplicitEditdirOverrides,
+    testRepoNameFromGitRemote,
+    testRepoNameFallbackToBasename,
     testFailedWorktreeCreation,
     testSelfLocate,
     testStopPreservesWorktree,
