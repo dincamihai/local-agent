@@ -12,12 +12,14 @@ blindly processing text.
 
 ```
 Claude ──docker run──▶ [Container: pi agent + gemma4]
-                           │  tools: read, write, bash, grep, find
-                           │  memory: recall, store, update, forget, consolidate, stats
-                           │  reads /workspace (mounted RO)
-                           │  writes /output (mounted RW)
-                           │  inference: host ollama via host.docker.internal:11434
-                           │  memory: host memory-lance-mcp via host.docker.internal:3100
+       │                  │  tools: read, write, bash, grep, find
+       │                  │  memory: ask, store (membrain) or memory_recall, etc. (lance)
+       │                  │  reads /workspace (mounted RO)
+       │                  │  writes /output (mounted RW)
+       │                  │  inference: host ollama via host.docker.internal:11434
+       │                  │  memory: host MCP bridge via host.docker.internal:5101
+       │                  └── OR host memory-lance-mcp via host.docker.internal:3100
+       ▼
 Claude ◀──reads output──┘
 ```
 
@@ -25,7 +27,9 @@ Claude ◀──reads output──┘
 
 - **gemma4** runs on host via ollama (Metal GPU on macOS)
 - **pi** (`@mariozechner/pi-coding-agent`) — lightweight coding agent inside Docker
-- **memory-lance-mcp** runs on host in HTTP mode (port 3100), accessed via a pi extension
+- **membrain MCP bridge** runs on host in HTTP mode (port 5101), MCP-over-HTTP wrapper around `membrain serve` stdio
+- **memory-lance-mcp** runs on host in HTTP mode (port 3100), alternative memory backend
+- **Swappable memory extension** — lance-extension.ts or membrain-extension.ts, selected via `MEMORY_BACKEND` env var
 - **Sandboxed** — only mounted folders are accessible, memory access is read/write
 
 ### Why memory matters for delegation
@@ -46,7 +50,19 @@ Memory turns delegation from "process this text" into "do this task with context
 ### Prerequisites
 
 1. **ollama** running on host with gemma4 loaded
-2. **memory-lance-mcp HTTP service** — runs as a launchd service on port 3100:
+2. **Memory backend** (choose one):
+
+   **Option A: Membrain** (recommended, graph-based memory)
+   - Memgraph running (`docker compose up -d` in `/home/mihai/repos/membrain/`)
+   - `membrain init` run (once)
+   - MCP bridge running on port 5101:
+     ```bash
+     cd /home/mihai/repos/membrain
+     node proxy/mcp-http-bridge.js 5101
+     ```
+   - `MEMORY_BACKEND=membrain` set when running Docker container
+
+   **Option B: memory-lance-mcp** (legacy, vector-only)
    ```
    ~/Library/LaunchAgents/com.memory-lance-mcp.http.plist
    ```
@@ -78,7 +94,9 @@ Memory turns delegation from "process this text" into "do this task with context
 |------|---------|
 | `pi-settings.json` | Sets gemma4 as default model/provider |
 | `pi-models.json` | Registers ollama at `host.docker.internal:11434/v1` |
-| `memory-extension.ts` | Pi extension wrapping memory MCP tools over HTTP |
+| `memory-extension.ts` | Pi extension: memory-lance-mcp tools over HTTP (port 3100) |
+| `membrain-extension.ts` | Pi extension: membrain MCP tools over HTTP (port 5101) |
+| `entrypoint.sh` | Wrapper: selects extension based on `MEMORY_BACKEND` env var |
 
 These are baked into the Docker image.
 
@@ -94,7 +112,20 @@ docker run --rm \
   -p "<task prompt>"
 ```
 
-The agent automatically has memory tools available via the extension. No extra flags needed.
+Default: lance memory backend (port 3100). To use membrain:
+
+```bash
+docker run --rm \
+  -e MEMORY_BACKEND=membrain \
+  -v "<input-folder>:/workspace:ro" \
+  -v "/path/to/local-agent/output:/output" \
+  --add-host=host.docker.internal:host-gateway \
+  local-agent \
+  --model gemma4 --no-session --tools read,write,bash \
+  -p "<task prompt>"
+```
+
+The agent gets memory tools based on the active extension: `ask`/`store` for membrain, `memory_recall`/etc for lance.
 
 ### Important notes
 
@@ -102,6 +133,7 @@ The agent automatically has memory tools available via the extension. No extra f
 - **Unix sockets don't cross** Colima's VM boundary — use TCP (`host.docker.internal`) instead.
 - **Memory server must be running** in HTTP mode before starting the Docker agent.
 - **Tools**: pi supports read, write, bash, edit, grep, find, ls — enable what you need via `--tools`.
+- **Memory tool names change** by backend: membrain exposes `ask`/`store`, lance exposes `memory_recall`/etc.
 
 ## Three delegation tiers
 
@@ -129,13 +161,27 @@ The agent automatically has memory tools available via the extension. No extra f
 
 ```
 local-agent/
-├── Dockerfile              # node:20-slim + pi + memory extension
+├── Dockerfile              # node:20-slim + pi + both extensions
 ├── pi-settings.json        # default model/provider
 ├── pi-models.json          # ollama provider config (host.docker.internal)
-├── memory-extension.ts     # pi extension: memory tools over HTTP
+├── memory-extension.ts     # pi extension: memory-lance-mcp tools over HTTP
+├── membrain-extension.ts   # pi extension: membrain MCP tools over HTTP
+├── entrypoint.sh           # selects extension based on MEMORY_BACKEND
 ├── .gitignore              # ignores output/
 ├── DESIGN.md               # this file
 └── output/                 # mount target for results (gitignored)
+```
+
+### Membrain side
+
+```
+membrain/
+├── proxy/
+│   ├── server.js          # simple REST proxy (/add, /context, port 5100)
+│   ├── mcp-http-bridge.js # MCP-over-HTTP wrapper (port 5101)
+│   └── mcp-http-bridge.test.js
+├── target/release/membrain # Rust binary (stdio MCP server)
+└── docker-compose.yml      # Memgraph
 ```
 
 ## Build
@@ -164,8 +210,10 @@ pi-bridge MCP server (stdio, host-side)
   ▼
 pi-agent (Docker container)
   ├─ tools: read, write, bash, grep, find
-  ├─ memory-extension ──HTTP──→ memory-lance-mcp (host:3100)
-  └─ inference ──HTTP──────────→ ollama/gemma4 (host:11434)
+  ├─ memory-extension ──HTTP──→ memory-lance-mcp (host:3100)   [MEMORY_BACKEND=lance]
+  │   OR
+  ├─ membrain-extension ──HTTP→ mcp-http-bridge (host:5101) → membrain serve (stdio)
+  └─ inference ──HTTP────────→ ollama/gemma4 (host:11434)
 ```
 
 ### MCP Tools
@@ -200,9 +248,12 @@ The MCP server is registered in `~/.claude.json` under `mcpServers`:
 
 ### Prerequisites
 
-Same as before (ollama + gemma4, memory-lance-mcp on port 3100, Docker image
-built), plus:
+Same as before (ollama + gemma4, Docker image built), plus one of:
 
+- **membrain**: MCP bridge running on port 5101 (`node proxy/mcp-http-bridge.js`)
+- **memory-lance-mcp**: HTTP service running on port 3100
+
+Plus:
 ```bash
 cd /path/to/local-agent && npm install
 ```

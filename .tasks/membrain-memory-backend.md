@@ -1,72 +1,67 @@
 ---
 column: Backlog
-title: Replace LanceDB memory with membrain as shared memory backend
+title: Create membrain extension to replace LanceDB memory backend
 ---
 
-# Replace LanceDB memory with membrain as shared memory backend
+# Create membrain extension to replace LanceDB memory backend
 ---
 column: backlog
 parent: local-agent-delegation-queue
 depends_on: []
 ---
 
-## Problem
+## Goal (DONE)
 
-`memory-extension.ts` currently talks to `memory-lance-mcp` (LanceDB vector store) on port 3100 via MCP-over-HTTP. Membrain uses Memgraph + vector search but runs its MCP server over stdio only (no HTTP endpoint).
+Create `membrain-extension.ts` and `mcp-http-bridge.js` so local-agent Docker containers can use membrain.
 
-## Goal
+## Implemented
 
-Wire local-agent Docker containers to use membrain's knowledge graph instead of LanceDB for memory recall/store.
+### 1. MCP-over-HTTP bridge (membrain/proxy/mcp-http-bridge.js)
+- Wraps `membrain serve` via stdio (spawn process)
+- Exposes MCP JSON-RPC over HTTP POST `/mcp`
+- Supports: `initialize`, `tools/list`, `tools/call`, `notifications/initialized`
+- Listens on port 5101 (configurable via MEMC_BRIDGE_PORT env var)
+- Container access via `host.docker.internal:5101`
+- Tests: 5/5 passing
 
-## Current Architecture
+### 2. Membrain extension (local-agent/membrain-extension.ts)
+- Copies lance-extension.ts structure but calls membrain tools directly
+- Exposes `ask` tool → membrain's `ask` (query + budget + session_id)
+- Exposes `store` tool → membrain's `store` (content + source + session_id)
+- No mapping layer — native tool names only
+- Defaults to port 5101
+- Tests: 4/4 passing
 
+### 3. Entrypoint wrapper (local-agent/entrypoint.sh)
+- Reads `MEMORY_BACKEND` env var (default: lance)
+- Loads `memory-extension.ts` or `membrain-extension.ts` accordingly
+
+### 4. Dockerfile updated
+- Copies both extensions + entrypoint.sh
+- ENTRYPOINT → entrypoint.sh
+
+### 5. DESIGN.md updated
+- New architecture diagram showing both backends
+- Updated setup instructions for both options
+- Files section updated
+
+### 6. Test scripts added to package.json
+
+## Usage
+
+```bash
+# Default (lance)
+docker run local-agent --model gemma4 -p "..."
+
+# Membrain
+MEMORY_BACKEND=membrain docker run \
+  -e MEMORY_BACKEND=membrain \
+  local-agent --model gemma4 -p "..."
 ```
-pi agent (Docker)
-  └── memory-extension.ts ──HTTP POST /mcp──→ memory-lance-mcp (host:3100)
-```
 
-Tools used by extension: `memory_recall`, `memory_store`, `memory_stats`, `memory_forget`, `memory_consolidate`, `memory_update`
+## Remaining
 
-## Membrain Side
-
-- MCP server: `membrain serve` (stdio JSON-RPC) — tools: `store`, `ask`
-- HTTP proxy: `proxy/server.js` (port 5100) — endpoints: `POST /add`, `POST /context`
-- Host-side binary at: `/home/mihai/repos/membrain/target/release/membrain`
-- Proxy runs on host, containers access via `host.docker.internal:5100`
-
-## Tasks
-
-### 1. Create MCP-over-HTTP wrapper for membrain
-
-The stdio MCP server can't run inside containers (glibc mismatch). Need an HTTP-to-stdio bridge that:
-- Exposes `initialize`, `tools/call`, `notifications/initialized` over HTTP POST
-- Wraps `membrain serve` via stdio (spawn process, pipe stdin/stdout)
-- Listens on configurable port (e.g. 5101) so it doesn't conflict with the simple proxy
-
-### 2. Update `memory-extension.ts`
-
-Map existing tool names to membrain's tools:
-| Old Tool | Membrain Tool | Notes |
-|----------|--------------|-------|
-| `memory_recall` | `ask` | query → query, budget → budget |
-| `memory_store` | `store` | text → content, add session_id |
-| `memory_stats` | N/A | Implement as custom query against Memgraph, or skip |
-| `memory_forget` | N/A | Membrain has no delete tool yet |
-| `memory_consolidate` | N/A | Not available — merge → store new, skip for now |
-| `memory_update` | `store` | Upsert by name (membrain dedupes on norm_name) |
-
-### 3. Dockerfile / run config
-
-- Set env var `MEMORY_MCP_HOST=host.docker.internal`, `MEMORY_MCP_PORT=5101`
-- Start the HTTP bridge on host before docker run (or document as prerequisite)
-
-### 4. Migration notes
-
-- LanceDB data won't migrate automatically. New memories go to membrain.
-- Stop `memory-lance-mcp` service once verified working.
-
-## Files to modify
-
-- `memory-extension.ts` — tool name mappings
-- New: `proxy/mcp-http-bridge.js` — MCP-over-HTTP wrapper around `membrain serve` stdio
-- `DESIGN.md` — update architecture diagram
+- [ ] Start bridge service (node proxy/mcp-http-bridge.js) before docker run
+- [ ] Test end-to-end with real docker container
+- [ ] Add bridge to systemd/launchd service for auto-start
+- [ ] Consider: stop memory-lance-mcp once fully migrated

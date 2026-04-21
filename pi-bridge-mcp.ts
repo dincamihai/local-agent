@@ -28,7 +28,7 @@ const DEFAULT_MODEL = process.env.PI_MODEL ?? "qwen3.6:35b-a3b-q8_0";
 const DEFAULT_TIMEOUT = 300_000; // 5 minutes
 export const LOCAL_AGENT_DIR = process.env.PI_LOCAL_AGENT_DIR ?? SCRIPT_DIR;
 export const OUTPUT_DIR = process.env.PI_OUTPUT_DIR ?? join(LOCAL_AGENT_DIR, "output");
-const STATE_FILE = process.env.PI_STATE_FILE ?? "/tmp/pi-bridge-state.json";
+const STATE_FILE = process.env.PI_STATE_FILE ?? `/tmp/pi-bridge-state-${process.pid}.json`;
 
 // ---------------------------------------------------------------------------
 // Log resource: subscribable container logs at pi://logs/current
@@ -206,8 +206,11 @@ class PiRpcClient {
       ...mounts,
       "-v", `${LOCAL_AGENT_DIR}/pi-models.json:/root/.pi/agent/models.json:ro`,
       "-v", `${LOCAL_AGENT_DIR}/pi-settings.json:/root/.pi/agent/settings.json:ro`,
-      "-v", `${LOCAL_AGENT_DIR}/memory-extension.ts:/ext/memory-extension.ts:ro`,
+      "-v", `${LOCAL_AGENT_DIR}/lance-extension.ts:/ext/lance-extension.ts:ro`,
+"-v", `${LOCAL_AGENT_DIR}/membrain-extension.ts:/ext/membrain-extension.ts:ro`,
+      "-e", `MEMORY_BACKEND=${process.env.MEMORY_BACKEND ?? "lance"}`,
       "--add-host=host.containers.internal:host-gateway",
+      "--add-host=host.docker.internal:host-gateway",
       DOCKER_IMAGE,
       "--mode", "rpc",
       "--model", DEFAULT_MODEL,
@@ -540,47 +543,42 @@ function clearState(): void {
 }
 
 function cleanupStaleInstances(): void {
-  // Kill orphaned pi-bridge-mcp processes that aren't in our process group.
-  // This prevents stale MCP instances from holding orphaned containers.
   const myPid = process.pid;
-  let myPgid: number;
-  try {
-    myPgid = parseInt(execSync(`ps -o pgid= -p ${myPid}`, { encoding: "utf-8" }).trim());
-  } catch {
-    myPgid = myPid; // fallback: assume own pgid
-  }
 
+  // Kill truly orphaned pi-bridge processes (ppid <= 1 = reparented to init, parent died)
   try {
     const out = execSync(`pgrep -f 'pi-bridge-mcp.ts'`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
     const pids = out.split("\n").map(p => parseInt(p.trim())).filter(p => p && p !== myPid);
     let killed = 0;
     for (const pid of pids) {
       try {
-        const pgid = parseInt(execSync(`ps -o pgid= -p ${pid}`, { encoding: "utf-8" }).trim());
-        if (pgid !== myPgid) {
+        const ppid = parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf-8" }).trim());
+        if (ppid <= 1) {
           process.kill(pid, "SIGTERM");
           killed++;
         }
-      } catch {
-        // Process exited between pgrep and now, skip
-      }
+      } catch {}
     }
-    if (killed > 0) {
-      process.stderr.write(`[pi-bridge] Killed ${killed} stale MCP process(es)\n`);
-    }
-  } catch {} // pgrep returns error if no matches
-
-  // Kill leftover pi-agent containers
-  try {
-    const containers = execSync(`podman ps -q --filter name=pi-`, { encoding: "utf-8" }).trim();
-    if (containers) {
-      execSync(`podman stop ${containers}`, { stdio: "ignore" });
-      process.stderr.write(`[pi-bridge] Stopped leftover container(s)\n`);
-    }
+    if (killed > 0) process.stderr.write(`[pi-bridge] Killed ${killed} orphaned MCP process(es)\n`);
   } catch {}
 
-  // Remove stale state file
-  clearState();
+  // Clean up containers owned by dead instances via per-PID state files
+  try {
+    const files = execSync(`ls /tmp/pi-bridge-state-*.json 2>/dev/null`, { encoding: "utf-8" })
+      .trim().split("\n").filter(Boolean);
+    for (const file of files) {
+      try {
+        const state: SavedState = JSON.parse(readFileSync(file, "utf-8"));
+        try {
+          process.kill(state.pid, 0); // throws if process is dead
+        } catch {
+          try { execSync(`podman stop ${state.containerName}`, { stdio: "ignore" }); } catch {}
+          process.stderr.write(`[pi-bridge] Stopped orphaned container: ${state.containerName}\n`);
+          unlinkSync(file);
+        }
+      } catch {}
+    }
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------

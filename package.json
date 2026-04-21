@@ -5,9 +5,17 @@
   "main": "pi-bridge-mcp.ts",
   "type": "module",
   "scripts": {
-    "test": "tsx pi-bridge-mcp.test.ts"
+    "test": "tsx pi-bridge-mcp.test.ts && tsx membrain-extension.test.ts",
+    "test:extension": "tsx membrain-extension.test.ts"
   },
-  "keywords": ["mcp", "llm", "ollama", "agent", "coding-agent", "claude"],
+  "keywords": [
+    "mcp",
+    "llm",
+    "ollama",
+    "agent",
+    "coding-agent",
+    "claude"
+  ],
   "author": "Mihai Dincă <dincamihai@gmail.com>",
   "license": "MIT",
   "repository": {
@@ -16,6 +24,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@sinclair/typebox": "^0.34.49",
     "zod": "^4.3.6"
   },
   "devDependencies": {
