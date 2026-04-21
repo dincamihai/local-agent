@@ -32,6 +32,7 @@ export const OUTPUT_DIR = process.env.PI_OUTPUT_DIR ?? join(LOCAL_AGENT_DIR, "ou
 const STATE_FILE = process.env.PI_STATE_FILE ?? `/tmp/pi-bridge-state-${process.pid}.json`;
 const PARALLEL_LIMIT = parseInt(process.env.PARALLEL_LIMIT ?? "1", 10);
 const QUEUE_POLL_INTERVAL = parseInt(process.env.QUEUE_POLL_INTERVAL ?? "5000", 10);
+const QUEUE_TASK_TIMEOUT = parseInt(process.env.QUEUE_TASK_TIMEOUT ?? "1800000", 10); // 30min default
 const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 
 function acquireGlobalSlot(instanceId: string): boolean {
@@ -1110,7 +1111,7 @@ async function processQueueTask(task: QueueTask): Promise<void> {
     saveState();
     await client.ensureReady();
     await client.prompt(task.prompt);
-    await client.waitForIdle();
+    await client.waitForIdle(QUEUE_TASK_TIMEOUT);
     const result = client.getResult();
     queueComplete(db, task.id, result ?? "(no output)");
   } catch (e: any) {
