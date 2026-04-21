@@ -1,6 +1,7 @@
 ---
-column: Backlog
+column: Done
 order: 99
+updated: true
 ---
 
 # pi_bridge: multi-instance support with global parallel limit

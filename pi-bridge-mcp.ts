@@ -12,7 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { spawn, execSync, type ChildProcess } from "child_process";
-import { writeFileSync, readFileSync, renameSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from "fs";
 import { StringDecoder } from "string_decoder";
 import { basename, dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -37,18 +37,19 @@ const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 
 function acquireGlobalSlot(instanceId: string): boolean {
   try {
-    execSync(`mkdir -p ${GLOBAL_SLOTS_DIR}`);
-    const files = execSync(`ls ${GLOBAL_SLOTS_DIR} 2>/dev/null || true`, { encoding: "utf-8" })
-      .trim().split("\n").filter(Boolean);
+    // Sanitize instanceId: allow only alphanumeric, underscore, hyphen
+    const safeId = instanceId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    mkdirSync(GLOBAL_SLOTS_DIR, { recursive: true });
+    const files = readdirSync(GLOBAL_SLOTS_DIR);
     let live = 0;
     for (const f of files) {
       const pid = parseInt(f.split("-")[0]);
       if (!pid) continue;
       try { process.kill(pid, 0); live++; }
-      catch { try { unlinkSync(`${GLOBAL_SLOTS_DIR}/${f}`); } catch {} }
+      catch { try { unlinkSync(join(GLOBAL_SLOTS_DIR, f)); } catch {} }
     }
     if (live >= PARALLEL_LIMIT) return false;
-    writeFileSync(`${GLOBAL_SLOTS_DIR}/${process.pid}-${instanceId}`, "");
+    writeFileSync(join(GLOBAL_SLOTS_DIR, `${process.pid}-${safeId}`), "");
     return true;
   } catch {
     return true; // fail open if slots dir inaccessible
@@ -56,7 +57,10 @@ function acquireGlobalSlot(instanceId: string): boolean {
 }
 
 function releaseGlobalSlot(instanceId: string): void {
-  try { unlinkSync(`${GLOBAL_SLOTS_DIR}/${process.pid}-${instanceId}`); } catch {}
+  try {
+    const safeId = instanceId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    unlinkSync(join(GLOBAL_SLOTS_DIR, `${process.pid}-${safeId}`));
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------

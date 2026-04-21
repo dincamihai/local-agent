@@ -1,8 +1,9 @@
 ---
-column: Backlog
+column: Done
 order: 40
 created: 2026-04-21
 parent: local-agent-delegation-queue
+updated: true
 ---
 
 # Delegation queue: board-tui integration

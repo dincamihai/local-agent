@@ -1,7 +1,8 @@
 ---
-column: Backlog
+column: Done
 order: 5
 created: 2026-04-21
+updated: true
 ---
 
 # local-agent: Delegation queue with agent pool
