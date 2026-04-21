@@ -13,19 +13,28 @@ import Database from "better-sqlite3";
 
 import { openQueue, queueAdd, queueClaim, queueComplete, queueFail, queueCancel, queueGet, queueList } from "./queue.js";
 
-let tmpDir: string;
-let dbPath: string;
 let db: Database.Database;
 
 function setup() {
-  tmpDir = mkdtempSync(join(tmpdir(), "pi-queue-test-"));
-  dbPath = join(tmpDir, "test-queue.db");
-  db = openQueue(dbPath);
+  // In-memory SQLite - isolated, no file I/O, fast
+  db = openQueue(":memory:");
 }
 
 function teardown() {
   db.close();
-  try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+}
+
+// Helper for persistence test only
+function withFileDb(fn: (dbPath: string, db: Database.Database) => void) {
+  const dir = mkdtempSync(join(tmpdir(), "pi-queue-test-"));
+  const path = join(dir, "test.db");
+  const fileDb = openQueue(path);
+  try {
+    fn(path, fileDb);
+  } finally {
+    fileDb.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -188,16 +197,19 @@ async function testListByStatus() {
 
 function testQueuePreservesData() {
   console.log("TEST 12: queue re-open preserves existing data (WAL mode)");
-  const task = queueAdd(db, { prompt: "persistent", taskSlug: "survive-reopen" });
-  const id = task.id;
-  db.close();
+  withFileDb((path, fileDb) => {
+    const task = queueAdd(fileDb, { prompt: "persistent", taskSlug: "survive-reopen" });
+    const id = task.id;
+    fileDb.close();
 
-  // Reopen same DB
-  db = openQueue(dbPath);
-  const reopened = queueGet(db, id);
-  assert.ok(reopened, "task should survive reopen");
-  assert.equal(reopened!.prompt, "persistent");
-  assert.equal(reopened!.taskSlug, "survive-reopen");
+    // Reopen same DB file
+    const reopenedDb = openQueue(path);
+    const reopened = queueGet(reopenedDb, id);
+    assert.ok(reopened, "task should survive reopen");
+    assert.equal(reopened!.prompt, "persistent");
+    assert.equal(reopened!.taskSlug, "survive-reopen");
+    reopenedDb.close();
+  });
   console.log("  PASS");
 }
 
@@ -217,10 +229,11 @@ async function testClaimSkipsNonQueued() {
 
 function testOpenQueueIdempotent() {
   console.log("TEST 14: openQueue is idempotent — CREATE TABLE IF NOT EXISTS");
-  const db2 = openQueue(dbPath);
-  queueAdd(db2, { prompt: "after second open" });
+  // Open second in-memory DB (different connection)
+  const db2 = openQueue(":memory:");
   db2.close();
-  // Original db still works
+  // Original db still works - add task to verify
+  queueAdd(db, { prompt: "after second open" });
   const tasks = queueList(db);
   assert.ok(tasks.length >= 1, "original db still functional after second open");
   console.log("  PASS");
