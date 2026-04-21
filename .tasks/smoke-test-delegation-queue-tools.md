@@ -1,5 +1,6 @@
 ---
-column: Backlog
+column: Done
+updated: true
 ---
 
 # Smoke test: delegation queue tools

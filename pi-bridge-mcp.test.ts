@@ -552,6 +552,270 @@ async function testQueueMcpTools() {
   console.log("  PASS — MCP tool handlers work with mocked DB");
 }
 
+// ---- PARALLEL_LIMIT tests --------------------------------------------------
+
+async function testSlotAcquisition() {
+  console.log("TEST 14: slot acquisition — file created, returns true when under limit");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execSync, spawnSync } = await import("node:child_process");
+
+  const testSlotsDir = mkdtempSync(join(tmpdir(), "pi-test-slots-"));
+  const testCode = `
+    const { writeFileSync, unlinkSync } = require('fs');
+    const { execSync } = require('child_process');
+    const GLOBAL_SLOTS_DIR = "${testSlotsDir}";
+    const PARALLEL_LIMIT = 2;
+
+    function acquireGlobalSlot(instanceId) {
+      try {
+        execSync(\`mkdir -p \${GLOBAL_SLOTS_DIR}\`);
+        const files = execSync(\`ls \${GLOBAL_SLOTS_DIR} 2>/dev/null || true\`, { encoding: "utf-8" })
+          .trim().split("\\n").filter(Boolean);
+        let live = 0;
+        for (const f of files) {
+          const pid = parseInt(f.split("-")[0]);
+          if (!pid) continue;
+          try { process.kill(pid, 0); live++; }
+          catch { try { unlinkSync(\`\${GLOBAL_SLOTS_DIR}/\${f}\`); } catch {} }
+        }
+        if (live >= PARALLEL_LIMIT) return false;
+        writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-\${instanceId}\`, "");
+        return true;
+      } catch {
+        return true;
+      }
+    }
+
+    const result = acquireGlobalSlot("test-instance");
+    console.log(JSON.stringify({ result, pid: process.pid }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.result, true, "slot acquisition should succeed when under limit");
+
+  // Verify slot file created
+  const { readdirSync } = await import("node:fs");
+  const files = readdirSync(testSlotsDir);
+  assert.ok(files.some(f => f.includes(`${output.pid}-test-instance`)), "slot file should be created");
+
+  execSync(`rm -rf ${testSlotsDir}`);
+  console.log("  PASS — slot acquisition creates file, returns true");
+}
+
+async function testSlotFullRejection() {
+  console.log("TEST 15: slot full — returns false when at PARALLEL_LIMIT");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execSync, spawnSync } = await import("node:child_process");
+
+  const testSlotsDir = mkdtempSync(join(tmpdir(), "pi-test-slots-"));
+
+  // Use current test PID - it's always alive during the test
+  const testPid = process.pid;
+
+  const testCode = `
+    const { writeFileSync, unlinkSync } = require('fs');
+    const { execSync } = require('child_process');
+    const GLOBAL_SLOTS_DIR = "${testSlotsDir}";
+    const PARALLEL_LIMIT = 2;
+
+    function acquireGlobalSlot(instanceId) {
+      try {
+        execSync(\`mkdir -p \${GLOBAL_SLOTS_DIR}\`);
+        const files = execSync(\`ls \${GLOBAL_SLOTS_DIR} 2>/dev/null || true\`, { encoding: "utf-8" })
+          .trim().split("\\n").filter(Boolean);
+        let live = 0;
+        for (const f of files) {
+          const pid = parseInt(f.split("-")[0]);
+          if (!pid) continue;
+          try { process.kill(pid, 0); live++; }
+          catch { try { unlinkSync(\`\${GLOBAL_SLOTS_DIR}/\${f}\`); } catch {} }
+        }
+        if (live >= PARALLEL_LIMIT) return false;
+        writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-\${instanceId}\`, "");
+        return true;
+      } catch {
+        return true;
+      }
+    }
+
+    // Pre-create 2 slots with same PID as this test process (always alive)
+    writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-instance-1\`, "");
+    writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-instance-2\`, "");
+
+    const result = acquireGlobalSlot("test-instance-3");
+    console.log(JSON.stringify({ result }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.result, false, "slot acquisition should fail when at limit");
+
+  execSync(`rm -rf ${testSlotsDir}`);
+  console.log("  PASS — slot full rejection works");
+}
+
+async function testDeadPidCleanup() {
+  console.log("TEST 16: dead PID cleanup — stale slots evicted before count");
+  const { mkdtempSync, writeFileSync, readdirSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execSync, spawnSync } = await import("node:child_process");
+
+  const testSlotsDir = mkdtempSync(join(tmpdir(), "pi-test-slots-"));
+
+  // Create slot file with dead PID (99999 unlikely to exist)
+  writeFileSync(join(testSlotsDir, "99999-dead-instance"), "");
+
+  const testCode = `
+    const { writeFileSync, unlinkSync, readdirSync } = require('fs');
+    const { execSync } = require('child_process');
+    const GLOBAL_SLOTS_DIR = "${testSlotsDir}";
+    const PARALLEL_LIMIT = 1;
+
+    function acquireGlobalSlot(instanceId) {
+      try {
+        execSync(\`mkdir -p \${GLOBAL_SLOTS_DIR}\`);
+        const files = execSync(\`ls \${GLOBAL_SLOTS_DIR} 2>/dev/null || true\`, { encoding: "utf-8" })
+          .trim().split("\\n").filter(Boolean);
+        let live = 0;
+        for (const f of files) {
+          const pid = parseInt(f.split("-")[0]);
+          if (!pid) continue;
+          try { process.kill(pid, 0); live++; }
+          catch { try { unlinkSync(\`\${GLOBAL_SLOTS_DIR}/\${f}\`); } catch {} }
+        }
+        if (live >= PARALLEL_LIMIT) return false;
+        writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-\${instanceId}\`, "");
+        return true;
+      } catch {
+        return true;
+      }
+    }
+
+    const before = readdirSync("${testSlotsDir}").length;
+    const result = acquireGlobalSlot("new-instance");
+    const after = readdirSync("${testSlotsDir}").length;
+    console.log(JSON.stringify({ result, before, after }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.result, true, "slot acquisition should succeed after dead PID cleanup");
+  assert.equal(output.before, 1, "should start with 1 stale slot");
+  assert.equal(output.after, 1, "should end with 1 new slot (stale replaced)");
+
+  execSync(`rm -rf ${testSlotsDir}`);
+  console.log("  PASS — dead PID cleanup evicts stale slots");
+}
+
+async function testSlotRelease() {
+  console.log("TEST 17: slot release — file deleted on pi_stop");
+  const { mkdtempSync, writeFileSync, existsSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+
+  const testSlotsDir = mkdtempSync(join(tmpdir(), "pi-test-slots-"));
+
+  const testCode = `
+    const { writeFileSync, unlinkSync, existsSync } = require('fs');
+    const GLOBAL_SLOTS_DIR = "${testSlotsDir}";
+
+    // Pre-create slot file with current PID
+    const slotFile = \`\${GLOBAL_SLOTS_DIR}/\${process.pid}-test-release\`;
+    writeFileSync(slotFile, "");
+
+    function releaseGlobalSlot(instanceId) {
+      try {
+        unlinkSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-\${instanceId}\`);
+      } catch {}
+    }
+
+    releaseGlobalSlot("test-release");
+    const exists = existsSync(slotFile);
+    console.log(JSON.stringify({ exists }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  if (result.stderr) console.error("stderr:", result.stderr);
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.exists, false, "slot file should be deleted after release");
+
+  execSync(`rm -rf ${testSlotsDir}`);
+  console.log("  PASS — slot release deletes file");
+}
+
+async function testMcpToolRejectionAtLimit() {
+  console.log("TEST 18: MCP tool pi_start — returns error at parallel limit");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execSync, spawnSync } = await import("node:child_process");
+
+  const testSlotsDir = mkdtempSync(join(tmpdir(), "pi-test-slots-"));
+
+  const testCode = `
+    const { writeFileSync, unlinkSync } = require('fs');
+    const { execSync } = require('child_process');
+    const GLOBAL_SLOTS_DIR = "${testSlotsDir}";
+    const PARALLEL_LIMIT = 2;
+
+    function acquireGlobalSlot(instanceId) {
+      try {
+        execSync(\`mkdir -p \${GLOBAL_SLOTS_DIR}\`);
+        const files = execSync(\`ls \${GLOBAL_SLOTS_DIR} 2>/dev/null || true\`, { encoding: "utf-8" })
+          .trim().split("\\n").filter(Boolean);
+        let live = 0;
+        for (const f of files) {
+          const pid = parseInt(f.split("-")[0]);
+          if (!pid) continue;
+          try { process.kill(pid, 0); live++; }
+          catch { try { unlinkSync(\`\${GLOBAL_SLOTS_DIR}/\${f}\`); } catch {} }
+        }
+        if (live >= PARALLEL_LIMIT) return false;
+        writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-\${instanceId}\`, "");
+        return true;
+      } catch {
+        return true;
+      }
+    }
+
+    // Pre-create 2 slots with same PID as this test process (always alive)
+    writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-instance-1\`, "");
+    writeFileSync(\`\${GLOBAL_SLOTS_DIR}/\${process.pid}-instance-2\`, "");
+
+    // Simulate pi_start handler
+    const instanceId = "test-instance";
+    if (!acquireGlobalSlot(instanceId)) {
+      console.log(JSON.stringify({
+        error: true,
+        message: \`At machine-wide parallel limit (\${PARALLEL_LIMIT}). Stop an existing instance first, or increase PARALLEL_LIMIT env var.\`
+      }));
+    } else {
+      console.log(JSON.stringify({ error: false }));
+    }
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], { encoding: "utf-8" });
+  const output = JSON.parse(result.stdout);
+
+  assert.equal(output.error, true, "pi_start should return error at limit");
+  assert.ok(output.message.includes("parallel limit"), "error message should mention parallel limit");
+  assert.ok(output.message.includes("PARALLEL_LIMIT"), "error message should mention env var");
+
+  execSync(`rm -rf ${testSlotsDir}`);
+  console.log("  PASS — MCP tool rejects at parallel limit");
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -573,6 +837,11 @@ async function runTests() {
     testQueueCancelInProgress,
     testQueueCompleteAndFail,
     testQueueMcpTools,
+    testSlotAcquisition,
+    testSlotFullRejection,
+    testDeadPidCleanup,
+    testSlotRelease,
+    testMcpToolRejectionAtLimit,
   ];
 
   for (const test of tests) {

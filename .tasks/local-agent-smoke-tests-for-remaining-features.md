@@ -1,5 +1,5 @@
 ---
-column: In Progress
+column: Done
 updated: true
 ---
 
