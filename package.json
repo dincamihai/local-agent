@@ -5,7 +5,9 @@
   "main": "pi-bridge-mcp.ts",
   "type": "module",
   "scripts": {
-    "test": "tsx pi-bridge-mcp.test.ts && tsx membrain-extension.test.ts",
+    "test": "tsx queue.test.ts && tsx pi-bridge-mcp.test.ts && tsx membrain-extension.test.ts",
+    "test:queue": "tsx queue.test.ts",
+    "test:bridge": "tsx pi-bridge-mcp.test.ts",
     "test:extension": "tsx membrain-extension.test.ts"
   },
   "keywords": [

@@ -19,8 +19,8 @@ export interface QueueTask {
   retryCount: number;
 }
 
-export function openQueue(): Database.Database {
-  const db = new Database(QUEUE_FILE);
+export function openQueue(path?: string): Database.Database {
+  const db = new Database(path ?? QUEUE_FILE);
   db.pragma("journal_mode = WAL");
   db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
@@ -76,7 +76,7 @@ export function queueAdd(
 export function queueClaim(db: Database.Database, agentId: string): QueueTask | null {
   const row = db.prepare(`
     UPDATE tasks SET status='processing', agent_id=?, started_at=?
-    WHERE id = (SELECT id FROM tasks WHERE status='queued' ORDER BY queued_at LIMIT 1)
+    WHERE id = (SELECT id FROM tasks WHERE status='queued' ORDER BY queued_at, id LIMIT 1)
     RETURNING *
   `).get(agentId, Date.now()) as any;
   return row ? rowToTask(row) : null;
