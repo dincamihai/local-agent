@@ -30,6 +30,31 @@ export const LOCAL_AGENT_DIR = process.env.PI_LOCAL_AGENT_DIR ?? SCRIPT_DIR;
 export const OUTPUT_DIR = process.env.PI_OUTPUT_DIR ?? join(LOCAL_AGENT_DIR, "output");
 const STATE_FILE = process.env.PI_STATE_FILE ?? `/tmp/pi-bridge-state-${process.pid}.json`;
 const PARALLEL_LIMIT = parseInt(process.env.PARALLEL_LIMIT ?? "1", 10);
+const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
+
+function acquireGlobalSlot(instanceId: string): boolean {
+  try {
+    execSync(`mkdir -p ${GLOBAL_SLOTS_DIR}`);
+    const files = execSync(`ls ${GLOBAL_SLOTS_DIR} 2>/dev/null || true`, { encoding: "utf-8" })
+      .trim().split("\n").filter(Boolean);
+    let live = 0;
+    for (const f of files) {
+      const pid = parseInt(f.split("-")[0]);
+      if (!pid) continue;
+      try { process.kill(pid, 0); live++; }
+      catch { try { unlinkSync(`${GLOBAL_SLOTS_DIR}/${f}`); } catch {} }
+    }
+    if (live >= PARALLEL_LIMIT) return false;
+    writeFileSync(`${GLOBAL_SLOTS_DIR}/${process.pid}-${instanceId}`, "");
+    return true;
+  } catch {
+    return true; // fail open if slots dir inaccessible
+  }
+}
+
+function releaseGlobalSlot(instanceId: string): void {
+  try { unlinkSync(`${GLOBAL_SLOTS_DIR}/${process.pid}-${instanceId}`); } catch {}
+}
 
 // ---------------------------------------------------------------------------
 // Resource subscription tracking
@@ -672,13 +697,14 @@ server.tool(
     editdir: z.string().optional().describe("(Deprecated) Explicit host directory to mount as /workspace (read-write). Overrides auto-worktree. Only use when workspace is not a git repo."),
   },
   async ({ workspace, task, editdir }) => {
-    if (instances.size >= PARALLEL_LIMIT) {
-      return { content: [{ type: "text", text: `At parallel limit (${PARALLEL_LIMIT}). Stop an existing instance first, or increase PARALLEL_LIMIT env var.` }], isError: true };
-    }
     try {
       const taskSlug = task ? basename(task, ".md") : null;
       const workspaceBase = workspace ? basename(workspace) : null;
       const instanceId = `pi-${taskSlug ?? workspaceBase ?? Date.now()}`;
+
+      if (!acquireGlobalSlot(instanceId)) {
+        return { content: [{ type: "text", text: `At machine-wide parallel limit (${PARALLEL_LIMIT}). Stop an existing instance first, or increase PARALLEL_LIMIT env var.` }], isError: true };
+      }
 
       const client = new PiRpcClient();
 
@@ -699,6 +725,7 @@ server.tool(
 
       client.onExit = () => {
         instances.delete(instanceId);
+        releaseGlobalSlot(instanceId);
         saveState();
       };
 
@@ -731,7 +758,10 @@ server.tool(
     const resolvedId = instance_id ?? [...instances.entries()].find(([, v]) => v === client)?.[0];
     const name = client.containerName;
     await client.stop();
-    if (resolvedId) instances.delete(resolvedId);
+    if (resolvedId) {
+      instances.delete(resolvedId);
+      releaseGlobalSlot(resolvedId);
+    }
     saveState();
     if (name) {
       try { unlinkSync(`/tmp/${name}.status`); } catch {}
