@@ -16,6 +16,7 @@ import { writeFileSync, readFileSync, renameSync, unlinkSync } from "fs";
 import { StringDecoder } from "string_decoder";
 import { basename, dirname, join } from "path";
 import { fileURLToPath } from "url";
+import { openQueue, queueAdd, queueClaim, queueComplete, queueFail, queueCancel, queueGet, queueList, type QueueTask } from "./queue.js";
 
 export const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +31,7 @@ export const LOCAL_AGENT_DIR = process.env.PI_LOCAL_AGENT_DIR ?? SCRIPT_DIR;
 export const OUTPUT_DIR = process.env.PI_OUTPUT_DIR ?? join(LOCAL_AGENT_DIR, "output");
 const STATE_FILE = process.env.PI_STATE_FILE ?? `/tmp/pi-bridge-state-${process.pid}.json`;
 const PARALLEL_LIMIT = parseInt(process.env.PARALLEL_LIMIT ?? "1", 10);
+const QUEUE_POLL_INTERVAL = parseInt(process.env.QUEUE_POLL_INTERVAL ?? "5000", 10);
 const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 
 function acquireGlobalSlot(instanceId: string): boolean {
@@ -637,6 +639,8 @@ function cleanupStaleInstances(): void {
 
 cleanupStaleInstances();
 
+const db = openQueue();
+
 const server = new McpServer({
   name: "pi-bridge",
   version: "1.0.0",
@@ -1019,6 +1023,128 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// Queue MCP tools
+// ---------------------------------------------------------------------------
+
+server.tool(
+  "queue_add",
+  "Add a task to the delegation queue. The worker loop will pick it up and run it with a local pi agent. Returns a task ID you can use with queue_status.",
+  {
+    prompt: z.string().describe("The task or prompt for the agent to complete"),
+    workspace: z.string().optional().describe("Host repo directory to mount as context"),
+    task_file: z.string().optional().describe("Host path to a task .md file to mount as /task.md"),
+    task_slug: z.string().optional().describe("Short slug for the task (used in instance naming)"),
+  },
+  async ({ prompt, workspace, task_file, task_slug }) => {
+    const task = queueAdd(db, { prompt, workspace, taskFile: task_file, taskSlug: task_slug });
+    return { content: [{ type: "text", text: `Task queued. ID: ${task.id}\nStatus: queued\nMonitor: queue_status id="${task.id}"` }] };
+  }
+);
+
+server.tool(
+  "queue_list",
+  "List all tasks in the delegation queue, optionally filtered by status.",
+  {
+    status: z.enum(["queued", "processing", "done", "failed"]).optional().describe("Filter by status"),
+  },
+  async ({ status }) => {
+    const tasks = queueList(db, status);
+    if (tasks.length === 0) return { content: [{ type: "text", text: "No tasks." }] };
+    return { content: [{ type: "text", text: JSON.stringify(tasks, null, 2) }] };
+  }
+);
+
+server.tool(
+  "queue_status",
+  "Get the status and result of a specific queued task.",
+  { id: z.string().describe("Task ID from queue_add") },
+  async ({ id }) => {
+    const task = queueGet(db, id);
+    if (!task) return { content: [{ type: "text", text: `Task ${id} not found.` }], isError: true };
+    return { content: [{ type: "text", text: JSON.stringify(task, null, 2) }] };
+  }
+);
+
+server.tool(
+  "queue_cancel",
+  "Cancel a queued task (only works if status is 'queued' — cannot cancel in-progress tasks).",
+  { id: z.string().describe("Task ID to cancel") },
+  async ({ id }) => {
+    const cancelled = queueCancel(db, id);
+    if (!cancelled) {
+      const task = queueGet(db, id);
+      if (!task) return { content: [{ type: "text", text: `Task ${id} not found.` }], isError: true };
+      return { content: [{ type: "text", text: `Cannot cancel task in status '${task.status}'.` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Task ${id} cancelled.` }] };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Queue worker
+// ---------------------------------------------------------------------------
+
+async function processQueueTask(task: QueueTask): Promise<void> {
+  const instanceId = `queue-${task.id.slice(0, 8)}`;
+  const client = new PiRpcClient();
+  instances.set(instanceId, client);
+
+  client.onAgentEnd = (error) => {
+    if (client.containerName) {
+      const sentinel = `/tmp/${client.containerName}.status`;
+      try { writeFileSync(sentinel, JSON.stringify({ done: true, error: error ?? null, ts: Date.now() })); } catch {}
+    }
+    saveState();
+    sendResourceUpdated("pi://agent/status");
+  };
+
+  client.onExit = () => {
+    instances.delete(instanceId);
+    releaseGlobalSlot(instanceId);
+    saveState();
+  };
+
+  try {
+    await client.start(task.workspace ?? undefined, task.taskFile ?? undefined, undefined, instanceId);
+    client.startLogTail(() => sendResourceUpdated("pi://logs/current"));
+    saveState();
+    await client.ensureReady();
+    await client.prompt(task.prompt);
+    await client.waitForIdle();
+    const result = client.getResult();
+    queueComplete(db, task.id, result ?? "(no output)");
+  } catch (e: any) {
+    queueFail(db, task.id, e.message);
+  } finally {
+    await client.stop();
+    instances.delete(instanceId);
+    releaseGlobalSlot(instanceId);
+    saveState();
+  }
+}
+
+async function workerTick(): Promise<void> {
+  // Cheap local check first — avoids touching the slot dir every 5s when busy
+  if (instances.size >= PARALLEL_LIMIT) return;
+
+  const task = queueClaim(db, `worker-${process.pid}`);
+  if (!task) return;
+
+  const instanceId = `queue-${task.id.slice(0, 8)}`;
+
+  // Acquire machine-wide slot; if at limit, put task back and bail
+  if (!acquireGlobalSlot(instanceId)) {
+    // Re-queue: reset status back to queued so another worker can pick it up
+    try {
+      db.prepare(`UPDATE tasks SET status='queued', agent_id=NULL, started_at=NULL WHERE id=?`).run(task.id);
+    } catch {}
+    return;
+  }
+
+  processQueueTask(task).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
@@ -1026,6 +1152,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write("pi-bridge MCP server running (stdio)\n");
+  setInterval(() => { workerTick().catch(() => {}); }, QUEUE_POLL_INTERVAL);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
