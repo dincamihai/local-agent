@@ -34,6 +34,21 @@ const PARALLEL_LIMIT = parseInt(process.env.PARALLEL_LIMIT ?? "1", 10);
 const QUEUE_POLL_INTERVAL = parseInt(process.env.QUEUE_POLL_INTERVAL ?? "5000", 10);
 const QUEUE_TASK_TIMEOUT = parseInt(process.env.QUEUE_TASK_TIMEOUT ?? "1800000", 10); // 30min default
 const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
+const PI_DEBUG = process.env.PI_DEBUG === "1";
+const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR ?? "/tmp/pi-bridge-logs";
+
+function captureContainerLogs(containerName: string, label?: string): void {
+  if (!PI_DEBUG) return;
+  try {
+    mkdirSync(PI_DEBUG_DIR, { recursive: true });
+    const suffix = label ? `-${label.replace(/[^a-zA-Z0-9_-]/g, "_")}` : "";
+    const logPath = `${PI_DEBUG_DIR}/${containerName}${suffix}-${Date.now()}.log`;
+    execSync(`podman logs ${containerName} > ${logPath} 2>&1`);
+    process.stderr.write(`[pi-bridge] debug log: ${logPath}\n`);
+  } catch (e: any) {
+    process.stderr.write(`[pi-bridge] failed to capture logs for ${containerName}: ${e.message}\n`);
+  }
+}
 
 function acquireGlobalSlot(instanceId: string): boolean {
   try {
@@ -800,6 +815,7 @@ server.tool(
     }
     const resolvedId = instance_id ?? [...instances.entries()].find(([, v]) => v === client)?.[0];
     const name = client.containerName;
+    if (name) captureContainerLogs(name);
     await client.stop();
     if (resolvedId) {
       instances.delete(resolvedId);
@@ -1164,6 +1180,7 @@ async function processQueueTask(task: QueueTask): Promise<void> {
   } catch (e: any) {
     queueFail(db, task.id, e.message);
   } finally {
+    if (client.containerName) captureContainerLogs(client.containerName, task.taskSlug ?? task.id);
     await client.stop();
     instances.delete(instanceId);
     releaseGlobalSlot(instanceId);

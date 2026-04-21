@@ -1007,6 +1007,106 @@ async function testFailOpenOnInaccessibleSlotsDir() {
   console.log("  PASS — fail-open behavior on inaccessible slots dir");
 }
 
+// ---- PI_DEBUG log capture tests --------------------------------------------
+
+async function testPiDebugWritesLogFile() {
+  console.log("TEST 21: PI_DEBUG=1 — log file created with containerName + label + timestamp");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+
+  const testLogDir = mkdtempSync(join(tmpdir(), "pi-test-debug-logs-"));
+
+  const testCode = `
+    const { mkdirSync, writeFileSync } = require('fs');
+    const { execSync: realExecSync } = require('child_process');
+
+    const PI_DEBUG = process.env.PI_DEBUG === "1";
+    const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR;
+
+    const capturedCommands = [];
+    function execSync(cmd) {
+      if (cmd.startsWith("podman logs")) {
+        const match = cmd.match(/ > (.+) 2>&1$/);
+        if (match) writeFileSync(match[1], "fake agent output\\n");
+        capturedCommands.push(cmd);
+        return;
+      }
+      return realExecSync(cmd);
+    }
+
+    function captureContainerLogs(containerName, label) {
+      if (!PI_DEBUG) return;
+      try {
+        mkdirSync(PI_DEBUG_DIR, { recursive: true });
+        const suffix = label ? "-" + label.replace(/[^a-zA-Z0-9_-]/g, "_") : "";
+        const logPath = PI_DEBUG_DIR + "/" + containerName + suffix + "-" + Date.now() + ".log";
+        execSync("podman logs " + containerName + " > " + logPath + " 2>&1");
+        process.stderr.write("[pi-bridge] debug log: " + logPath + "\\n");
+      } catch (e) {
+        process.stderr.write("[pi-bridge] failed: " + e.message + "\\n");
+      }
+    }
+
+    captureContainerLogs("pi-my-task", "my-task-slug");
+    const files = require('fs').readdirSync(PI_DEBUG_DIR);
+    console.log(JSON.stringify({ files, commands: capturedCommands }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], {
+    encoding: "utf-8",
+    env: { ...process.env, PI_DEBUG: "1", PI_DEBUG_DIR: testLogDir },
+  });
+
+  const output = JSON.parse(result.stdout);
+  assert.ok(output.files.length === 1, "one log file created");
+  assert.ok(output.files[0].startsWith("pi-my-task-my-task-slug-"), "filename has containerName + label");
+  assert.ok(output.files[0].endsWith(".log"), "filename ends with .log");
+  assert.ok(output.commands[0].startsWith("podman logs pi-my-task"), "podman logs called for container");
+
+  execSync(`rm -rf ${testLogDir}`);
+  console.log("  PASS — PI_DEBUG=1 writes log file with correct name");
+}
+
+async function testPiDebugOffNoFiles() {
+  console.log("TEST 22: PI_DEBUG unset — no log files created");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+
+  const testLogDir = mkdtempSync(join(tmpdir(), "pi-test-debug-logs-"));
+
+  const testCode = `
+    const { mkdirSync, writeFileSync } = require('fs');
+
+    const PI_DEBUG = process.env.PI_DEBUG === "1";
+    const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR;
+
+    function captureContainerLogs(containerName, label) {
+      if (!PI_DEBUG) return;
+      mkdirSync(PI_DEBUG_DIR, { recursive: true });
+      writeFileSync(PI_DEBUG_DIR + "/" + containerName + ".log", "");
+    }
+
+    captureContainerLogs("pi-my-task", "my-task-slug");
+    const files = require('fs').readdirSync(PI_DEBUG_DIR);
+    console.log(JSON.stringify({ files }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], {
+    encoding: "utf-8",
+    env: { ...process.env, PI_DEBUG: "", PI_DEBUG_DIR: testLogDir },
+  });
+
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.files.length, 0, "no log files when PI_DEBUG is unset");
+
+  execSync(`rm -rf ${testLogDir}`);
+  console.log("  PASS — PI_DEBUG unset produces no log files");
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -1037,6 +1137,8 @@ async function runTests() {
     testMcpToolRejectionAtLimit,
     testPathTraversalInSlotFilename,
     testFailOpenOnInaccessibleSlotsDir,
+    testPiDebugWritesLogFile,
+    testPiDebugOffNoFiles,
   ];
 
   for (const test of tests) {
