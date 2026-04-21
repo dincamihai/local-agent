@@ -2,12 +2,31 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { request } from "http";
 
-const MCP_HOST = process.env.MEMORY_MCP_HOST ?? "host.docker.internal";
-const MCP_PORT = parseInt(process.env.MEMORY_MCP_PORT ?? "5101", 10);
+// Mutable getters so tests can simulate env var changes on re-import
+let _host = process.env.MEMORY_MCP_HOST ?? "host.docker.internal";
+let _port = parseInt(process.env.MEMORY_MCP_PORT ?? "5101", 10);
+
+export const getHost = (): string => _host;
+export const getPort = (): number => _port;
+
+export function setEnv(host?: string, port?: string) {
+  _host = host ?? process.env.MEMORY_MCP_HOST ?? "host.docker.internal";
+  _port = parseInt(port ?? process.env.MEMORY_MCP_PORT ?? "5101", 10);
+}
 
 let sessionId: string | undefined;
+let initialized = false;
 
-function mcpCall(method: string, params: Record<string, any>, id: number): Promise<any> {
+export function getSessionId(): string | undefined { return sessionId; }
+export function resetTestState() { sessionId = undefined; initialized = false; }
+
+export function mcpCall(
+  method: string,
+  params: Record<string, any>,
+  id: number,
+  host?: string,
+  port?: number,
+): Promise<any> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     const headers: Record<string, string> = {
@@ -16,8 +35,11 @@ function mcpCall(method: string, params: Record<string, any>, id: number): Promi
     };
     if (sessionId) headers["mcp-session-id"] = sessionId;
 
+    const h = host ?? getHost();
+    const p = port ?? getPort();
+
     const req = request(
-      { hostname: MCP_HOST, port: MCP_PORT, path: "/mcp", method: "POST", headers },
+      { hostname: h, port: p, path: "/mcp", method: "POST", headers },
       (res) => {
         let data = "";
         res.on("data", (chunk: Buffer) => (data += chunk.toString()));
@@ -52,19 +74,21 @@ function mcpCall(method: string, params: Record<string, any>, id: number): Promi
   });
 }
 
-async function ensureInitialized() {
-  if (!sessionId) {
+export async function ensureInitialized() {
+  if (!initialized) {
     await mcpCall("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "pi-membrain-ext", version: "1.0" },
     }, 0);
+    initialized = true;
     await mcpCall("notifications/initialized", {}, 0).catch(() => {});
   }
 }
 
-async function callTool(name: string, args: Record<string, any>): Promise<string> {
-  await ensureInitialized();
+// Allow tests to call mcpCall directly without going through ensureInitialized
+export async function callTool(name: string, args: Record<string, any>, skipInit = false): Promise<string> {
+  if (!skipInit) await ensureInitialized();
   const result = await mcpCall("tools/call", { name, arguments: args }, Date.now());
   if (result?.content?.[0]?.text) return result.content[0].text;
   return JSON.stringify(result);
