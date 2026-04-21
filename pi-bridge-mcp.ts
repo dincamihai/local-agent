@@ -351,13 +351,8 @@ class PiRpcClient {
     this.stopReading?.();
     this.stopReading = null;
 
-    // Remove worktree without merging (call pi_merge first to preserve changes)
-    if (this.worktreePath && this.worktreeWorkDir) {
-      try { execSync(`git -C ${this.worktreeWorkDir} worktree remove --force ${this.worktreePath}`); } catch {}
-      this.worktreePath = null;
-      this.worktreeWorkDir = null;
-      this.worktreeBranch = null;
-    }
+    // Worktree removal is the caller's responsibility — call pi_merge first, then pi_stop.
+    // Never auto-remove worktree here; changes must be reviewed first.
 
     this.proc.kill("SIGTERM");
     await new Promise<void>((resolve) => {
@@ -1113,7 +1108,16 @@ async function processQueueTask(task: QueueTask): Promise<void> {
     await client.prompt(task.prompt);
     await client.waitForIdle(QUEUE_TASK_TIMEOUT);
     const result = client.getResult();
-    queueComplete(db, task.id, result ?? "(no output)");
+
+    // Auto-merge worktree before stopping container
+    const mergeResult = client.mergeWorktree(`pi: agent changes for ${task.taskSlug ?? task.id}`);
+    const mergeFailed = mergeResult.includes("Merge failed");
+
+    if (mergeFailed) {
+      queueFail(db, task.id, `Agent completed but merge failed:\n${mergeResult}\n\nWorktree preserved for manual merge.`);
+    } else {
+      queueComplete(db, task.id, result ?? "(no output)");
+    }
   } catch (e: any) {
     queueFail(db, task.id, e.message);
   } finally {

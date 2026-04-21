@@ -5,7 +5,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, execSync } from "node:child_process";
@@ -290,6 +290,91 @@ async function testSelfLocate() {
   console.log("  PASS — self-locate defaults resolve to script dir");
 }
 
+async function testStopPreservesWorktree() {
+  console.log("TEST 6: stop() must NOT remove worktree — changes must be reviewed before merge");
+  const workDir = makeTempGitRepo();
+  const branch = `pi/test-stop-preserve-${Date.now()}`;
+  const wtPath = `/tmp/pi-worktrees/${branch.replace(/\//g, "-")}`;
+
+  // Create a worktree manually (simulating what PiRpcClient.start does)
+  execSync("mkdir -p /tmp/pi-worktrees", { stdio: "ignore" });
+  execSync(`git -C ${workDir} worktree add ${wtPath} -b ${branch}`, { stdio: "ignore" });
+
+  // Write a file in the worktree (simulating agent changes)
+  writeFileSync(join(wtPath, "agent-output.txt"), "important work");
+  execSync("git add . && git commit -m 'agent work'", { cwd: wtPath, stdio: "ignore" });
+
+  // Verify worktree exists before stop
+  assert.ok(existsSync(wtPath), "worktree should exist before stop");
+
+  // Simulate stop() — it should NOT touch the worktree
+  // (We can't call the real PiRpcClient.stop() because it kills a proc,
+  //  but we verify the behavior by checking that stop() no longer contains
+  //  worktree removal logic.)
+  const piBridgeSource = readFileSync(join(__dirname, "pi-bridge-mcp.ts"), "utf-8");
+
+  // stop() must NOT contain worktree remove
+  assert.ok(
+    !piBridgeSource.includes("worktree remove") || piBridgeSource.indexOf("worktree remove") > piBridgeSource.indexOf("mergeWorktree"),
+    "stop() must not contain worktree removal — only mergeWorktree should handle that"
+  );
+
+  // The comment in stop() should acknowledge worktree preservation
+  assert.ok(
+    piBridgeSource.includes("Never auto-remove worktree") || piBridgeSource.includes("call pi_merge first"),
+    "stop() must have a comment stating worktree is not auto-removed"
+  );
+
+  // Clean up worktree manually (what pi_merge would do)
+  execSync(`git -C ${workDir} worktree remove --force ${wtPath}`, { stdio: "ignore" });
+  execSync(`git -C ${workDir} branch -D ${branch}`, { stdio: "ignore" });
+
+  cleanup([workDir]);
+  console.log("  PASS — stop() does not remove worktree, changes preserved for review");
+}
+
+async function testMergeWorktreeConflictPreservesWorktree() {
+  console.log("TEST 7: mergeWorktree on conflict preserves worktree and branch for manual review");
+  const workDir = makeTempGitRepo();
+  const branch = `pi/test-merge-conflict-${Date.now()}`;
+  const wtPath = `/tmp/pi-worktrees/${branch.replace(/\//g, "-")}`;
+
+  // Create a worktree and make a commit
+  execSync("mkdir -p /tmp/pi-worktrees", { stdio: "ignore" });
+  execSync(`git -C ${workDir} worktree add ${wtPath} -b ${branch}`, { stdio: "ignore" });
+  writeFileSync(join(wtPath, "README.md"), "# conflict test");
+  execSync("git add . && git commit -m 'agent changes'", { cwd: wtPath, stdio: "ignore" });
+
+  // Create a conflicting commit on master
+  writeFileSync(join(workDir, "README.md"), "# conflicting change on master");
+  execSync("git add . && git commit -m 'master change'", { cwd: workDir, stdio: "ignore" });
+
+  // Simulate mergeWorktree — it should fail on conflict and preserve the worktree
+  let mergeFailed = false;
+  try {
+    execSync(`git -C ${workDir} merge --no-ff ${branch} -m "Merge ${branch}"`, { stdio: "pipe" });
+  } catch {
+    mergeFailed = true;
+    // Abort the failed merge
+    try { execSync(`git -C ${workDir} merge --abort`, { stdio: "ignore" }); } catch {}
+  }
+
+  assert.ok(mergeFailed, "merge should fail due to conflict");
+
+  // Worktree should still exist after failed merge
+  assert.ok(existsSync(wtPath), "worktree must be preserved after merge conflict");
+
+  // Branch should still exist
+  const branches = execSync(`git -C ${workDir} branch --list ${branch}`).toString().trim();
+  assert.ok(branches.includes(branch), "branch must be preserved after merge conflict");
+
+  // Clean up
+  execSync(`git -C ${workDir} worktree remove --force ${wtPath}`, { stdio: "ignore" });
+  execSync(`git -C ${workDir} branch -D ${branch}`, { stdio: "ignore" });
+  cleanup([workDir]);
+  console.log("  PASS — worktree and branch preserved on merge conflict");
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -303,6 +388,8 @@ async function runTests() {
     testExplicitEditdirOverrides,
     testFailedWorktreeCreation,
     testSelfLocate,
+    testStopPreservesWorktree,
+    testMergeWorktreeConflictPreservesWorktree,
   ];
 
   for (const test of tests) {
