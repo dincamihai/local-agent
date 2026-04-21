@@ -375,6 +375,183 @@ async function testMergeWorktreeConflictPreservesWorktree() {
   console.log("  PASS — worktree and branch preserved on merge conflict");
 }
 
+// ---- delegation queue tests ------------------------------------------------
+
+async function testQueueAddAndList() {
+  console.log("TEST 8: queue_add + queue_list — task added, listed with correct status");
+  const { openQueue, queueAdd, queueList, queueGet, queueCancel, queueClaim, queueComplete, queueFail } = await import("./queue.js");
+  const db = openQueue(":memory:");
+
+  const task = queueAdd(db, { prompt: "test prompt", taskSlug: "test-task" });
+  assert.ok(task.id, "task ID should be returned");
+  assert.equal(task.status, "queued", "status should be queued");
+  assert.equal(task.prompt, "test prompt", "prompt should match");
+
+  const listed = queueList(db);
+  assert.equal(listed.length, 1, "one task should be listed");
+  assert.equal(listed[0].id, task.id, "listed task ID should match");
+  assert.equal(listed[0].status, "queued", "listed status should be queued");
+
+  const queuedOnly = queueList(db, "queued");
+  assert.equal(queuedOnly.length, 1, "filter by queued should return one task");
+
+  const processing = queueList(db, "processing");
+  assert.equal(processing.length, 0, "filter by processing should return empty");
+
+  console.log("  PASS — queue_add inserts task, queue_list returns correct status");
+}
+
+async function testQueueStatus() {
+  console.log("TEST 9: queue_status — returns correct task details by ID");
+  const { openQueue, queueAdd, queueGet } = await import("./queue.js");
+  const db = openQueue(":memory:");
+
+  const task = queueAdd(db, { prompt: "status test", workspace: "/tmp/test", taskSlug: "status-test" });
+  const fetched = queueGet(db, task.id);
+
+  assert.ok(fetched, "task should be found");
+  assert.equal(fetched.id, task.id, "ID should match");
+  assert.equal(fetched.prompt, "status test", "prompt should match");
+  assert.equal(fetched.workspace, "/tmp/test", "workspace should match");
+  assert.equal(fetched.taskSlug, "status-test", "slug should match");
+  assert.ok(fetched.queuedAt, "queuedAt should be set");
+  assert.equal(fetched.status, "queued", "status should be queued");
+
+  const notFound = queueGet(db, "nonexistent-id");
+  assert.equal(notFound, null, "non-existent task should return null");
+
+  console.log("  PASS — queue_status returns correct task details");
+}
+
+async function testQueueCancelQueued() {
+  console.log("TEST 10: queue_cancel — queued task cancelled successfully");
+  const { openQueue, queueAdd, queueCancel, queueGet } = await import("./queue.js");
+  const db = openQueue(":memory:");
+
+  const task = queueAdd(db, { prompt: "cancel me" });
+  const cancelled = queueCancel(db, task.id);
+
+  assert.equal(cancelled, true, "cancel should return true for queued task");
+  const fetched = queueGet(db, task.id);
+  assert.equal(fetched, null, "cancelled task should be deleted");
+
+  console.log("  PASS — queue_cancel removes queued task");
+}
+
+async function testQueueCancelInProgress() {
+  console.log("TEST 11: queue_cancel — processing task cannot be cancelled");
+  const { openQueue, queueAdd, queueClaim, queueCancel, queueGet } = await import("./queue.js");
+  const db = openQueue(":memory:");
+
+  const task = queueAdd(db, { prompt: "in progress test" });
+  queueClaim(db, "worker-test");
+
+  const cancelled = queueCancel(db, task.id);
+  assert.equal(cancelled, false, "cancel should return false for processing task");
+
+  const fetched = queueGet(db, task.id);
+  assert.equal(fetched?.status, "processing", "status should still be processing");
+  assert.ok(fetched?.agentId, "agentId should be set");
+
+  console.log("  PASS — queue_cancel rejects processing task");
+}
+
+async function testQueueCompleteAndFail() {
+  console.log("TEST 12: queue_complete + queue_fail — task completion and failure");
+  const { openQueue, queueAdd, queueClaim, queueComplete, queueFail, queueGet } = await import("./queue.js");
+  const db = openQueue(":memory:");
+
+  // Test complete
+  const task1 = queueAdd(db, { prompt: "success test" });
+  queueClaim(db, "worker-1");
+  queueComplete(db, task1.id, "result output");
+
+  const completed = queueGet(db, task1.id);
+  assert.equal(completed?.status, "done", "status should be done");
+  assert.equal(completed?.result, "result output", "result should match");
+  assert.ok(completed?.completedAt, "completedAt should be set");
+
+  // Test fail
+  const task2 = queueAdd(db, { prompt: "failure test" });
+  queueClaim(db, "worker-2");
+  queueFail(db, task2.id, "error message");
+
+  const failed = queueGet(db, task2.id);
+  assert.equal(failed?.status, "failed", "status should be failed");
+  assert.equal(failed?.error, "error message", "error should match");
+  assert.ok(failed?.completedAt, "completedAt should be set");
+
+  console.log("  PASS — queue_complete and queue_fail work correctly");
+}
+
+async function testQueueMcpTools() {
+  console.log("TEST 13: queue MCP tools — mocked external deps, test handler logic");
+  const { openQueue, queueAdd, queueClaim } = await import("./queue.js");
+  const db = openQueue(":memory:");
+
+  // Mock server.tool handler functions (extracted from pi-bridge-mcp.ts)
+  const mockHandlers = {
+    queue_add: async ({ prompt, workspace, task_file, task_slug }: any) => {
+      const task = queueAdd(db, { prompt, workspace, taskFile: task_file, taskSlug: task_slug });
+      return { content: [{ type: "text" as const, text: `Task queued. ID: ${task.id}\nStatus: queued` }] };
+    },
+    queue_list: async ({ status }: any) => {
+      const { queueList } = await import("./queue.js");
+      const tasks = queueList(db, status);
+      if (tasks.length === 0) return { content: [{ type: "text" as const, text: "No tasks." }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(tasks, null, 2) }] };
+    },
+    queue_status: async ({ id }: any) => {
+      const { queueGet } = await import("./queue.js");
+      const task = queueGet(db, id);
+      if (!task) return { content: [{ type: "text" as const, text: `Task ${id} not found.` }], isError: true };
+      return { content: [{ type: "text" as const, text: JSON.stringify(task, null, 2) }] };
+    },
+    queue_cancel: async ({ id }: any) => {
+      const { queueCancel, queueGet } = await import("./queue.js");
+      const cancelled = queueCancel(db, id);
+      if (!cancelled) {
+        const task = queueGet(db, id);
+        if (!task) return { content: [{ type: "text" as const, text: `Task ${id} not found.` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Cannot cancel task in status '${task.status}'.` }], isError: true };
+      }
+      return { content: [{ type: "text" as const, text: `Task ${id} cancelled.` }] };
+    },
+  };
+
+  // Test queue_add handler
+  const addResult = await mockHandlers.queue_add({ prompt: "test", task_slug: "test-1" });
+  assert.ok(addResult.content[0].text.includes("Task queued"), "queue_add should return success");
+  const taskId = addResult.content[0].text.match(/ID: ([\w-]+)/)?.[1];
+  assert.ok(taskId, "task ID should be returned");
+
+  // Test queue_list handler
+  const listResult = await mockHandlers.queue_list({});
+  const listed = JSON.parse(listResult.content[0].text);
+  assert.equal(listed.length, 1, "one task should be listed");
+  assert.equal(listed[0].id, taskId, "task ID should match");
+
+  // Test queue_status handler
+  const statusResult = await mockHandlers.queue_status({ id: taskId });
+  const status = JSON.parse(statusResult.content[0].text);
+  assert.equal(status.id, taskId, "status ID should match");
+  assert.equal(status.status, "queued", "status should be queued");
+
+  // Test queue_status not found
+  const notFoundResult = await mockHandlers.queue_status({ id: "nonexistent" });
+  assert.equal(notFoundResult.isError, true, "not found should return error");
+
+  // Claim task (simulate worker)
+  queueClaim(db, "worker-test");
+
+  // Test queue_cancel on processing task
+  const cancelResult = await mockHandlers.queue_cancel({ id: taskId });
+  assert.equal(cancelResult.isError, true, "cancelling processing task should return error");
+  assert.ok(cancelResult.content[0].text.includes("Cannot cancel"), "error message should explain");
+
+  console.log("  PASS — MCP tool handlers work with mocked DB");
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -390,6 +567,12 @@ async function runTests() {
     testSelfLocate,
     testStopPreservesWorktree,
     testMergeWorktreeConflictPreservesWorktree,
+    testQueueAddAndList,
+    testQueueStatus,
+    testQueueCancelQueued,
+    testQueueCancelInProgress,
+    testQueueCompleteAndFail,
+    testQueueMcpTools,
   ];
 
   for (const test of tests) {
