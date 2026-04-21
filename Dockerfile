@@ -9,5 +9,6 @@ RUN mkdir -p /root/.pi/agent /ext
 COPY pi-settings.json /root/.pi/agent/settings.json
 COPY pi-models.json /root/.pi/agent/models.json
 COPY memory-extension.ts /ext/memory-extension.ts
+ENV PI_AGENT_CONTAINER=1
 WORKDIR /workspace
 ENTRYPOINT ["pi", "--no-skills", "--no-prompt-templates", "-e", "/ext/memory-extension.ts"]

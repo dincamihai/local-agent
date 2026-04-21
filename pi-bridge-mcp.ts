@@ -24,7 +24,7 @@ export const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 // ---------------------------------------------------------------------------
 
 const DOCKER_IMAGE = process.env.PI_DOCKER_IMAGE ?? "local-agent";
-const DEFAULT_MODEL = process.env.PI_MODEL ?? "qwen3.6:latest";
+const DEFAULT_MODEL = process.env.PI_MODEL ?? "qwen3.6:35b-a3b-q8_0";
 const DEFAULT_TIMEOUT = 300_000; // 5 minutes
 export const LOCAL_AGENT_DIR = process.env.PI_LOCAL_AGENT_DIR ?? SCRIPT_DIR;
 export const OUTPUT_DIR = process.env.PI_OUTPUT_DIR ?? join(LOCAL_AGENT_DIR, "output");
@@ -207,7 +207,7 @@ class PiRpcClient {
       "-v", `${LOCAL_AGENT_DIR}/pi-models.json:/root/.pi/agent/models.json:ro`,
       "-v", `${LOCAL_AGENT_DIR}/pi-settings.json:/root/.pi/agent/settings.json:ro`,
       "-v", `${LOCAL_AGENT_DIR}/memory-extension.ts:/ext/memory-extension.ts:ro`,
-      "--add-host=host.docker.internal:host-gateway",
+      "--add-host=host.containers.internal:host-gateway",
       DOCKER_IMAGE,
       "--mode", "rpc",
       "--model", DEFAULT_MODEL,

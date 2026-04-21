@@ -41,6 +41,52 @@ Allow running multiple pi agents in parallel, with a server-side concurrency lim
 - Parallel limit enforced atomically (no race on concurrent `pi_start` calls)
 - Document `PARALLEL_LIMIT` in README
 
+## Research findings (2026-04-21)
+
+### host.docker.internal DNS issue
+- Netavark backend doesn't always resolve `host.docker.internal`
+- `host.containers.internal` works reliably
+- Fix: use `--add-host=host.containers.internal:host-gateway` in pi-bridge-mcp.ts
+
+### Ollama num_parallel setting
+- `num_parallel` controls concurrent request batching
+- Default: 1 (sequential processing)
+- Setting `num_parallel=2` or higher:
+  - Batches multiple requests into single GPU pass
+  - Higher throughput (total tokens/sec)
+  - Higher latency per request (waits for batch fill)
+  - More VRAM usage
+- For pi agents: probably not worth it unless running 3+ agents
+- Agents spend most time waiting for tool execution, not model inference
+- Configure in pi-models.json:
+  ```json
+  {
+    "providers": {
+      "ollama": {
+        "models": [{
+          "id": "qwen3.6:35b-a3b-q8_0",
+          "numParallel": 2
+        }]
+      }
+    }
+  }
+  ```
+
+### Agent interleaving pattern
+- Model idle during tool execution (bash, file I/O)
+- Window: 100ms-10s per tool call
+- Two agents can interleave:
+  - Agent A: bash command → wait → model free
+  - Agent B: thinks, queues tool call
+  - Agent A: gets result, thinks
+  - Agent B: gets model turn
+- Real bottleneck: ollama processes one request at a time (unless num_parallel > 1)
+
+### Workaround options tested
+1. `--network=host` - works, but container shares all host ports
+2. `host.containers.internal` - preferred, DNS resolves correctly
+3. Add to `/etc/hosts` - requires sudo
+
 ## Tasks
 
 - [ ] Refactor server state from single container ref to `dict[id → container]`
