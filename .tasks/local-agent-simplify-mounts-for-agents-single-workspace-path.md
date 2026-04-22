@@ -1,5 +1,11 @@
 ---
-column: Backlog
+column: Done
+order: 1
+updated: true
+---
+
+---
+column: Done
 order: 1
 ---
 
@@ -38,16 +44,6 @@ Internal variable `workDir` also misnamed — suggests writeable workspace, actu
 
 `workDir` → `contextDir` in `PiAgent.start()` signature and mount logic. Makes read-only intent explicit. Param name `workspace` stays for backward compat.
 
-### Before
-```ts
-async start(workDir?: string, taskFile?: string, editDir?: string, name?: string)
-```
-
-### After
-```ts
-async start(contextDir?: string, taskFile?: string, editDir?: string, name?: string)
-```
-
 ## Cases
 
 | Scenario | Mounts |
@@ -56,35 +52,9 @@ async start(contextDir?: string, taskFile?: string, editDir?: string, name?: str
 | Non-git repo (editdir) | `/workspace:rw` only — editdir contents |
 | Read-only (no editdir, non-git) | `/context:ro` only — original workspace |
 
-## Code change
+## Result
 
-`pi-bridge-mcp.ts` mount construction (~line 257):
-```ts
-const mounts: string[] = [];
-
-if (worktreePath) {
-  // Worktree active — single writeable mount, NO /context
-  mounts.push("-v", `${worktreePath}:/workspace:rw`);
-} else if (editDir) {
-  // Explicit editdir (deprecated)
-  mounts.push("-v", `${editDir}:/workspace:rw`);
-} else if (contextDir) {
-  // Read-only fallback — contextDir is the original workspace
-  mounts.push("-v", `${contextDir}:/context:ro`);
-}
-
-// Always mount output directory
-mounts.push("-v", `${OUTPUT_DIR}:/output`);
-```
-
-## Files
-
-- `pi-bridge-mcp.ts` — mount logic in `PiAgent.start()`, variable rename
-- `pi-bridge-mcp.test.ts` — test mount construction for each case, update mock calls
-
-## Notes
-- Backward compat: `workspace` param name unchanged in MCP schema
-- `editdir` param still works (deprecated), maps to `/workspace`
-- Read-only mode unchanged (no `editdir`, no worktree, non-git workspace)
-- Skill documentation should reference `/workspace` only for editing
-- `pi_merge` still meaningful for git worktree mode
+- Commits: `be1fa4a` (single-mount fix), `115942d` (mount flow tests)
+- `pi-bridge-mcp.ts` — mount logic skips `/context` when worktree active, variable renamed to `contextDir`
+- `pi-bridge-mcp.test.ts` — 6 mount flow tests added (TEST 23-28), all passing
+- 34 total tests passing in pi-bridge suite

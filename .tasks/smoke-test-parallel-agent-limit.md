@@ -1,5 +1,11 @@
 ---
-column: Backlog
+column: Done
+updated: true
+---
+
+---
+column: Done
+order: 1000
 ---
 
 # Smoke test: parallel agent limit
@@ -15,19 +21,14 @@ Slot directory enforces machine-wide concurrency across all `pi-bridge-mcp.ts` p
 3. If count >= limit → rejects `pi_start`
 4. **releaseGlobalSlot** — deletes slot file on `pi_stop` or process exit
 
-Self-heals after crashes by checking if PID in slot file is still alive.
+## Result
 
-## Status
-
-**NOT COVERED** — needs new tests.
-
-## Test cases
-
-1. **Slot acquisition** — count < limit → slot acquired, file created in `/tmp/pi-bridge-slots/`
-2. **Slot full** — count >= limit → `pi_start` rejected
-3. **Dead PID cleanup** — stale PID files evicted before count check
-4. **Slot release** — `pi_stop` → file deleted, count decremented
-
-## File
-
-`pi-bridge-mcp.test.ts`
+- Commit: `c62b479`
+- Tests added to `pi-bridge-mcp.test.ts`:
+  - TEST 14: `testSlotAcquisition`
+  - TEST 15: `testSlotFullRejection`
+  - TEST 16: `testDeadPidCleanup`
+  - TEST 17: `testSlotRelease`
+  - TEST 18: `testMcpToolRejectionAtLimit`
+- All 34 pi-bridge tests passing
+- Slot sanitization fix (`0b945d7`) also tested via `testPathTraversalInSlotFilename`

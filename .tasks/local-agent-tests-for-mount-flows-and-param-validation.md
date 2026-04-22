@@ -1,5 +1,11 @@
 ---
-column: Backlog
+column: Done
+updated: true
+---
+
+---
+column: Done
+order: 1000
 ---
 
 # local-agent: tests for mount flows and param validation
@@ -7,10 +13,6 @@ column: Backlog
 ## Goal
 
 Write tests for all mount flow combinations. Find logic flaws by testing edge cases.
-
-## Status
-
-Implemented in commit [pending]. 6 mount flow tests added, all passing.
 
 ## Test matrix
 
@@ -22,29 +24,15 @@ Implemented in commit [pending]. 6 mount flow tests added, all passing.
 | Non-git read-only | non-git path | none | none | `/context:ro` only |
 | Remote mode | hidden | hidden | URL | `/output` only (container clones internally) |
 
-## Tests added
+## Result
 
-| # | Test | Status |
-|---|------|--------|
-| 23 | testMountWorktreeOnly | PASS |
-| 24 | testMountEditdirOverridesWorktree | PASS |
-| 25 | testMountReadOnlyFallback | PASS |
-| 26 | testMountTaskFile | PASS |
-| 27 | testMountOutputAlwaysPresent | PASS |
-| 28 | testNoDualMountBug | PASS |
-
-## Key findings
-
-- Dual-mount bug confirmed fixed: worktree active → no `/context` mount
-- Explicit editdir correctly suppresses worktree creation
-- Non-git workspace falls back to `/context:ro` as expected
-- Output mount present in all modes
-- Task file mount appended when provided
-
-## Files
-
-- `pi-bridge-mcp.test.ts` — mount flow tests added
-
-## Notes
-- All 30 tests passing (24 existing + 6 new)
-- Mount logic extracted into test clients to avoid actual container spawn
+- Commits: `115942d` (mount flow tests), `68f84f0` (remote delegation TDD tests)
+- Tests added to `pi-bridge-mcp.test.ts`:
+  - TEST 23: `testMountWorktreeOnly`
+  - TEST 24: `testMountEditdirOverridesWorktree`
+  - TEST 25: `testMountReadOnlyFallback`
+  - TEST 26: `testMountTaskFile`
+  - TEST 27: `testMountOutputAlwaysPresent`
+  - TEST 28: `testNoDualMountBug`
+- All 34 pi-bridge tests passing
+- Dual-mount bug confirmed fixed

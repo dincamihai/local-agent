@@ -1,5 +1,11 @@
 ---
-column: Backlog
+column: Done
+updated: true
+---
+
+---
+column: Done
+order: 1000
 ---
 
 # Smoke test: auto git worktree
@@ -14,17 +20,11 @@ When `pi_start` receives a `workspace` path that is a git repo:
 3. Mounts worktree as `/workspace` (read-write) inside container
 4. On `pi_stop`, removes worktree: `git worktree remove --force <path>`
 
-If not a git repo or worktree creation fails → falls back to no write mount.
-Explicit `editdir` param overrides worktree auto-create.
+## Result
 
-## Status
-
-**COVERED** — `pi-bridge-mcp.test.ts` TEST 1-4:
-- Happy path (git repo → worktree created)
-- Not git repo (no worktree, no error)
-- Explicit editdir (overrides auto-create)
-- Failed creation (fallback to no write mount)
-
-## File
-
-`pi-bridge-mcp.test.ts` (already tested)
+- Covered by `pi-bridge-mcp.test.ts` TEST 1-4:
+  - TEST 1: `testHappyPathWorktree` — git repo → worktree created with repo name in path
+  - TEST 2: `testNoGitWorkspace` — no git repo → no worktree, falls back to basename
+  - TEST 3a: `testExplicitEditdirOverrides` — explicit editdir suppresses worktree auto-create
+  - TEST 4: `testFailedWorktreeCreation` — failed creation → falls back to no write mount
+- All 34 pi-bridge tests passing
