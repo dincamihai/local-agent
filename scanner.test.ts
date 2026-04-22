@@ -473,6 +473,248 @@ async function test_scanner_cancelled_clears_frontmatter() {
   }
 }
 
+// ---- Mock PiRpcClient for testing processQueueTask ------ -------- -------
+
+class MockPiRpcClient {
+  containerName: string | null = null;
+  private _result: string | null = null;
+  private _throwAt: string | null = null;
+  private _throwError: Error | null = null;
+
+  async start(): Promise<void> {
+    this.containerName = "mock-agent";
+    if (this._throwAt === "start") throw this._throwError!;
+  }
+  async ensureReady(): Promise<void> {
+    if (this._throwAt === "ensureReady") throw this._throwError!;
+  }
+  async prompt(): Promise<void> {
+    if (this._throwAt === "prompt") throw this._throwError!;
+  }
+  async waitForIdle(): Promise<void> {
+    if (this._throwAt === "waitForIdle") throw this._throwError!;
+  }
+  getResult(): string | null { return this._result; }
+  async stop(): Promise<void> { this.containerName = null; }
+  get isRunning(): boolean { return this.containerName !== null; }
+
+  setResult(result: string) { this._result = result; }
+  willThrowAt(step: string, err: Error) { this._throwAt = step; this._throwError = err; }
+}
+
+// ---- test 8: scanner finds queued task and enqueues it ------ -------- -------
+
+async function test_scanner_finds_queued_task() {
+  console.log("TEST 8: scanner finds queued task and enqueues it");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const { openQueue, queueList } = await import("./queue.js");
+
+  const tasksDir = makeTempDir("pi-test-scan-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const dbDir = makeTempDir("pi-test-db-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  writeTaskCard(tasksDir, "delegate-me", { delegation_status: "queued", column: "Backlog" }, "# Delegate Me\nDo work");
+
+  const mockPath = path.join(mockBinDir, "board-tui-mcp");
+  fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+  fs.chmodSync(mockPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  const oldBoardDir = process.env.BOARD_TASKS_DIR;
+  process.env.PATH = mockBinDir + path.delimiter + (oldPath ?? "");
+  process.env.BOARD_TASKS_DIR = tasksDir;
+
+  try {
+    await mod.scanReposForDelegation(queueDb, tasksDir);
+
+    const tasks = queueList(queueDb);
+    assert.equal(tasks.length, 1, "should enqueue 1 task");
+    assert.equal(tasks[0].taskSlug, "delegate-me", "task slug should match");
+    assert.equal(tasks[0].status, "queued", "status should be queued");
+
+    const content = fs.readFileSync(path.join(tasksDir, "delegate-me.md"), "utf-8");
+    assert.ok(content.includes("delegation_status: processing"), "card should be updated to processing");
+
+    console.log("  PASS — scanner finds queued task and enqueues it");
+  } finally {
+    process.env.PATH = oldPath;
+    process.env.BOARD_TASKS_DIR = oldBoardDir;
+    cleanup([tasksDir, mockBinDir, dbDir]);
+  }
+}
+
+// ---- test 9: scanner skips already-enqueued task ------ -------- -------
+
+async function test_scanner_skips_already_enqueued() {
+  console.log("TEST 9: scanner skips already-enqueued task");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const { openQueue, queueList, queueAdd } = await import("./queue.js");
+
+  const tasksDir = makeTempDir("pi-test-scan-dup-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const dbDir = makeTempDir("pi-test-db-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  writeTaskCard(tasksDir, "dup-task", { delegation_status: "queued", column: "Backlog" }, "# Dup Task\nDo work");
+  queueAdd(queueDb, { prompt: "existing", taskSlug: "dup-task" });
+
+  const mockPath = path.join(mockBinDir, "board-tui-mcp");
+  fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+  fs.chmodSync(mockPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  const oldBoardDir = process.env.BOARD_TASKS_DIR;
+  process.env.PATH = mockBinDir + path.delimiter + (oldPath ?? "");
+  process.env.BOARD_TASKS_DIR = tasksDir;
+
+  try {
+    await mod.scanReposForDelegation(queueDb, tasksDir);
+
+    const tasks = queueList(queueDb);
+    assert.equal(tasks.length, 1, "should not add duplicate");
+    assert.equal(tasks[0].taskSlug, "dup-task", "existing task preserved");
+
+    console.log("  PASS — scanner skips already-enqueued task");
+  } finally {
+    process.env.PATH = oldPath;
+    process.env.BOARD_TASKS_DIR = oldBoardDir;
+    cleanup([tasksDir, mockBinDir, dbDir]);
+  }
+}
+
+// ---- test 10: scanner skips done tasks ------ -------- -------
+
+async function test_scanner_skips_done_tasks() {
+  console.log("TEST 10: scanner skips done tasks");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const { openQueue, queueList } = await import("./queue.js");
+
+  const tasksDir = makeTempDir("pi-test-scan-done-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const dbDir = makeTempDir("pi-test-db-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  writeTaskCard(tasksDir, "done-task", { delegation_status: "done", column: "Done" }, "# Done Task\nComplete");
+
+  const mockPath = path.join(mockBinDir, "board-tui-mcp");
+  fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+  fs.chmodSync(mockPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  const oldBoardDir = process.env.BOARD_TASKS_DIR;
+  process.env.PATH = mockBinDir + path.delimiter + (oldPath ?? "");
+  process.env.BOARD_TASKS_DIR = tasksDir;
+
+  try {
+    await mod.scanReposForDelegation(queueDb, tasksDir);
+
+    const tasks = queueList(queueDb);
+    assert.equal(tasks.length, 0, "should not enqueue done tasks");
+
+    console.log("  PASS — scanner skips done tasks");
+  } finally {
+    process.env.PATH = oldPath;
+    process.env.BOARD_TASKS_DIR = oldBoardDir;
+    cleanup([tasksDir, mockBinDir, dbDir]);
+  }
+}
+
+// ---- test 11: processQueueTask success updates queue and card ------ --------
+
+async function test_processQueueTask_success() {
+  console.log("TEST 11: processQueueTask success updates queue and card");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const { openQueue, queueAdd, queueGet } = await import("./queue.js");
+
+  const tasksDir = makeTempDir("pi-test-pq-success-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const dbDir = makeTempDir("pi-test-db-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  writeTaskCard(tasksDir, "success-task", { delegation_status: "processing", column: "In Progress" }, "# Success Task\nDo work");
+  const task = queueAdd(queueDb, { prompt: "do work", taskSlug: "success-task" });
+
+  const mockPath = path.join(mockBinDir, "board-tui-mcp");
+  fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+  fs.chmodSync(mockPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  const oldBoardDir = process.env.BOARD_TASKS_DIR;
+  process.env.PATH = mockBinDir + path.delimiter + (oldPath ?? "");
+  process.env.BOARD_TASKS_DIR = tasksDir;
+
+  try {
+    const mockClient = new MockPiRpcClient();
+    mockClient.setResult("Agent completed the work");
+    await mod.processQueueTask(task, mockClient, queueDb, tasksDir);
+
+    const updated = queueGet(queueDb, task.id);
+    assert.equal(updated?.status, "done", "queue status should be done");
+    assert.equal(updated?.result, "Agent completed the work", "result should match");
+
+    const content = fs.readFileSync(path.join(tasksDir, "success-task.md"), "utf-8");
+    assert.ok(content.includes("delegation_status: done"), "card frontmatter should be done");
+    assert.ok(content.includes("Agent completed the work"), "card body should have result");
+
+    console.log("  PASS — processQueueTask success updates queue and card");
+  } finally {
+    process.env.PATH = oldPath;
+    process.env.BOARD_TASKS_DIR = oldBoardDir;
+    cleanup([tasksDir, mockBinDir, dbDir]);
+  }
+}
+
+// ---- test 12: processQueueTask failure updates queue and card ------ --------
+
+async function test_processQueueTask_failure() {
+  console.log("TEST 12: processQueueTask failure updates queue and card");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const { openQueue, queueAdd, queueGet } = await import("./queue.js");
+
+  const tasksDir = makeTempDir("pi-test-pq-fail-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const dbDir = makeTempDir("pi-test-db-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  writeTaskCard(tasksDir, "fail-task", { delegation_status: "processing", column: "In Progress" }, "# Fail Task\nDo work");
+  const task = queueAdd(queueDb, { prompt: "do work", taskSlug: "fail-task" });
+
+  const mockPath = path.join(mockBinDir, "board-tui-mcp");
+  fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+  fs.chmodSync(mockPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  const oldBoardDir = process.env.BOARD_TASKS_DIR;
+  process.env.PATH = mockBinDir + path.delimiter + (oldPath ?? "");
+  process.env.BOARD_TASKS_DIR = tasksDir;
+
+  try {
+    const mockClient = new MockPiRpcClient();
+    mockClient.willThrowAt("waitForIdle", new Error("Agent crashed"));
+    await mod.processQueueTask(task, mockClient, queueDb, tasksDir);
+
+    const updated = queueGet(queueDb, task.id);
+    assert.equal(updated?.status, "failed", "queue status should be failed");
+    assert.ok(updated?.error?.includes("Agent crashed"), "error should be recorded");
+
+    const content = fs.readFileSync(path.join(tasksDir, "fail-task.md"), "utf-8");
+    assert.ok(content.includes("delegation_status: failed"), "card frontmatter should be failed");
+    assert.ok(content.includes("Agent crashed"), "card body should have error");
+
+    console.log("  PASS — processQueueTask failure updates queue and card");
+  } finally {
+    process.env.PATH = oldPath;
+    process.env.BOARD_TASKS_DIR = oldBoardDir;
+    cleanup([tasksDir, mockBinDir, dbDir]);
+  }
+}
+
 // ---- runner ------ ------ ------ ------ -------- ------- ------ --------- -------- ------- --
 
 async function runTests() {
@@ -488,6 +730,11 @@ async function runTests() {
     test_syncTaskCard_updates_frontmatter_and_body,
     test_syncTaskCard_appends_to_existing_result,
     test_scanner_cancelled_clears_frontmatter,
+    test_scanner_finds_queued_task,
+    test_scanner_skips_already_enqueued,
+    test_scanner_skips_done_tasks,
+    test_processQueueTask_success,
+    test_processQueueTask_failure,
   ];
 
   for (const test of tests) {

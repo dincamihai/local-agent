@@ -1344,11 +1344,12 @@ export async function setFrontmatter(repoDir: string, slug: string, key: string,
  * 3. For each task: queueAdd(), set_frontmatter(slug, "delegation_status", "processing")
  * 4. Closes MCP client
  */
-export async function scanReposForDelegation(): Promise<void> {
+export async function scanReposForDelegation(queueDb: ReturnType<typeof openQueue> = db, repoDir?: string): Promise<void> {
+  const tasksDir = repoDir ?? BOARD_TASKS_DIR;
   const client = new Client({ name: "pi-bridge-scanner", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: "board-tui-mcp",
-    env: { ...getDefaultEnvironment(), BOARD_TASKS_DIR },
+    env: { ...getDefaultEnvironment(), BOARD_TASKS_DIR: tasksDir },
   });
 
   try {
@@ -1366,11 +1367,11 @@ export async function scanReposForDelegation(): Promise<void> {
 
     if (cancelledTasks.length > 0) {
       process.stderr.write(`[pi-bridge] scanner: found ${cancelledTasks.length} cancelled task(s)\n`);
-      const queuedTasks = queueList(db, "queued");
+      const queuedTasks = queueList(queueDb, "queued");
       for (const ct of cancelledTasks) {
         const match = queuedTasks.find(q => q.taskSlug === ct.slug);
         if (match) {
-          queueCancel(db, match.id);
+          queueCancel(queueDb, match.id);
           process.stderr.write(`[pi-bridge] scanner: cancelled queued task ${ct.slug} (id ${match.id})\n`);
         }
         // Clear delegation_status frontmatter regardless of queue state
@@ -1407,7 +1408,7 @@ export async function scanReposForDelegation(): Promise<void> {
 
     for (const task of tasks) {
       // Skip if already enqueued (same slug exists in queue)
-      const existingSlugs = queueList(db).map(t => t.taskSlug).filter(Boolean) as string[];
+      const existingSlugs = queueList(queueDb).map(t => t.taskSlug).filter(Boolean) as string[];
       if (existingSlugs.includes(task.slug)) {
         process.stderr.write(`[pi-bridge] scanner: skipping already-enqueued task: ${task.slug}\n`);
         continue;
@@ -1421,7 +1422,7 @@ export async function scanReposForDelegation(): Promise<void> {
       }
 
       // Enqueue the task
-      queueAdd(db, {
+      queueAdd(queueDb, {
         prompt: prompt ?? `Process delegation task: ${task.slug}`,
         workspace: undefined,
         taskFile: undefined,
@@ -1497,9 +1498,10 @@ export async function syncTaskCard(
 /**
  * Process a single queue task: start pi agent, run prompt, update queue and card.
  */
-async function processQueueTask(task: QueueTask): Promise<void> {
+export async function processQueueTask(task: QueueTask, piClient?: PiRpcClient, queueDb: ReturnType<typeof openQueue> = db, repoDir?: string): Promise<void> {
   const instanceId = `queue-${task.id.slice(0, 8)}`;
-  const client = new PiRpcClient();
+  const client = piClient ?? new PiRpcClient();
+  const cardDir = repoDir ?? BOARD_TASKS_DIR;
 
   try {
     const workspace = task.workspace ?? LOCAL_AGENT_DIR;
@@ -1509,14 +1511,14 @@ async function processQueueTask(task: QueueTask): Promise<void> {
     await client.waitForIdle(QUEUE_TASK_TIMEOUT);
     const result = client.getResult();
 
-    queueComplete(db, task.id, result ?? "");
+    queueComplete(queueDb, task.id, result ?? "");
     if (task.taskSlug) {
-      await syncTaskCard(BOARD_TASKS_DIR, task.taskSlug, "done", result ?? undefined).catch(() => {});
+      await syncTaskCard(cardDir, task.taskSlug, "done", result ?? undefined).catch(() => {});
     }
   } catch (e: any) {
-    queueFail(db, task.id, e.message);
+    queueFail(queueDb, task.id, e.message);
     if (task.taskSlug) {
-      await syncTaskCard(BOARD_TASKS_DIR, task.taskSlug, "failed", e.message).catch(() => {});
+      await syncTaskCard(cardDir, task.taskSlug, "failed", e.message).catch(() => {});
     }
   } finally {
     await client.stop();
