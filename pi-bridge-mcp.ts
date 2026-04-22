@@ -11,6 +11,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn, execSync, type ChildProcess } from "child_process";
 import { writeFileSync, readFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from "fs";
 import { StringDecoder } from "string_decoder";
@@ -37,6 +39,7 @@ const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 const PI_DEBUG = process.env.PI_DEBUG === "1";
 const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR ?? "/tmp/pi-bridge-logs";
 const REMOTE_DELEGATION = process.env.REMOTE_DELEGATION === "1";
+const BOARD_TASKS_DIR = process.env.BOARD_TASKS_DIR ?? join(LOCAL_AGENT_DIR, ".tasks");
 
 function captureContainerLogs(containerName: string, label?: string): void {
   if (!PI_DEBUG) return;
@@ -1315,7 +1318,97 @@ async function processQueueTask(task: QueueTask): Promise<void> {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Board-tui delegation scanner
+// ---------------------------------------------------------------------------
+
+/**
+ * Scans board-tui for queued delegation tasks and enqueues them into the
+ * local-agent queue. Called every QUEUE_POLL_INTERVAL from the worker loop.
+ *
+ * 1. Spawns board-tui MCP client via stdio
+ * 2. Calls list_delegated_tasks("queued")
+ * 3. For each task: queueAdd(), set_frontmatter(slug, "delegation_status", "processing")
+ * 4. Closes MCP client
+ */
+export async function scanReposForDelegation(): Promise<void> {
+  const client = new Client({ name: "pi-bridge-scanner", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: "board-tui-mcp",
+    env: { ...getDefaultEnvironment(), BOARD_TASKS_DIR },
+  });
+
+  try {
+    await client.connect(transport);
+    process.stderr.write("[pi-bridge] scanner: connected to board-tui-mcp\n");
+
+    // Call list_delegated_tasks("queued") to find queued delegation tasks
+    const result = await client.callTool({
+      name: "list_delegated_tasks",
+      arguments: { status: "queued" },
+    });
+
+    const taskText = result.content?.[0]?.type === "text" ? result.content[0].text : "[]";
+    let tasks: Array<{ slug: string; body?: string }> = [];
+    try {
+      tasks = JSON.parse(taskText);
+    } catch { /* empty results */ }
+
+    if (tasks.length === 0) {
+      process.stderr.write("[pi-bridge] scanner: no queued tasks found\n");
+      return;
+    }
+
+    process.stderr.write(`[pi-bridge] scanner: found ${tasks.length} queued task(s)\n`);
+
+    for (const task of tasks) {
+      // Skip if already enqueued (same slug exists in queue)
+      const existingSlugs = queueList(db).map(t => t.taskSlug).filter(Boolean) as string[];
+      if (existingSlugs.includes(task.slug)) {
+        process.stderr.write(`[pi-bridge] scanner: skipping already-enqueued task: ${task.slug}\n`);
+        continue;
+      }
+
+      // Build prompt from task body (strip frontmatter if present)
+      let prompt: string | undefined;
+      if (task.body) {
+        const fmMatch = task.body.match(/^(---\n[\\s\\S]*?\n---)\\s*([\\s\\S]*)$/);
+        prompt = fmMatch ? fmMatch[2]?.trim() ?? task.body : task.body;
+      }
+
+      // Enqueue the task
+      queueAdd(db, {
+        prompt: prompt ?? `Process delegation task: ${task.slug}`,
+        workspace: undefined,
+        taskFile: undefined,
+        taskSlug: task.slug,
+      });
+
+      // Update frontmatter: set delegation_status to processing
+      try {
+        await client.callTool({
+          name: "set_frontmatter",
+          arguments: { slug: task.slug, key: "delegation_status", value: "processing" },
+        });
+        process.stderr.write(`[pi-bridge] scanner: enqueued task ${task.slug} → processing\n`);
+      } catch (e: any) {
+        process.stderr.write(`[pi-bridge] scanner: failed to set frontmatter for ${task.slug}: ${e.message}\n`);
+      }
+    }
+
+  } catch (e: any) {
+    process.stderr.write(`[pi-bridge] scanner: error — ${e.message}\n`);
+  } finally {
+    await transport.close();
+    process.stderr.write("[pi-bridge] scanner: board-tui-mcp client closed\n");
+  }
+}
+
 async function workerTick(): Promise<void> {
+  // Scan board-tui for queued delegation tasks (non-blocking)
+  scanReposForDelegation().catch(() => {});
+
   // Cheap local check first — avoids touching the slot dir every 5s when busy
   if (instances.size >= PARALLEL_LIMIT) return;
 
