@@ -717,6 +717,7 @@ interface CleanupDeps {
   readFileSync?: typeof import("fs").readFileSync;
   unlinkSync?: typeof import("fs").unlinkSync;
   stderrWrite?: typeof process.stderr.write;
+  captureContainerLogs?: (containerName: string) => void;
 }
 
 export function cleanupStaleInstances(deps?: CleanupDeps): void {
@@ -725,6 +726,7 @@ export function cleanupStaleInstances(deps?: CleanupDeps): void {
   const read = deps?.readFileSync ?? readFileSync;
   const unlk = deps?.unlinkSync ?? unlinkSync;
   const w = deps?.stderrWrite ?? process.stderr.write;
+  const captureLogs = deps?.captureContainerLogs ?? captureContainerLogs;
 
   const myPid = process.pid;
 
@@ -757,6 +759,7 @@ export function cleanupStaleInstances(deps?: CleanupDeps): void {
         } catch {
           // Process dead — clean up all its containers
           for (const inst of state.instances ?? []) {
+            try { captureLogs(inst.containerName); } catch {}
             try { exec(`podman stop ${inst.containerName}`, { stdio: "ignore" }); } catch {}
             w(`[pi-bridge] Stopped orphaned container: ${inst.containerName}\n`);
           }

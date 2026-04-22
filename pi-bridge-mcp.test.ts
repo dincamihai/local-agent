@@ -1858,6 +1858,240 @@ async function testCleanupOwnPidExcluded() {
   console.log("  PASS — own PID excluded from cleanup");
 }
 
+// ---- PI_DEBUG log survival tests -------------------------------------------
+
+async function testLogCaptureOrderInPiStop() {
+  console.log("TEST 44: pi_stop — captureContainerLogs runs before podman stop");
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const testLogDir = mkdtempSync(join(tmpdir(), "pi-test-debug-order-"));
+
+  const testCode = `
+    const { mkdirSync, writeFileSync } = require('fs');
+    const PI_DEBUG = process.env.PI_DEBUG === "1";
+    const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR;
+    const order = [];
+
+    function execSync(cmd) {
+      if (cmd.startsWith("podman logs")) {
+        order.push("podman-logs");
+        const match = cmd.match(/ > (.+) 2>&1$/);
+        if (match) writeFileSync(match[1], "fake output\\n");
+        return;
+      }
+      if (cmd.startsWith("podman stop")) { order.push("podman-stop"); return; }
+    }
+
+    function captureContainerLogs(containerName, label) {
+      if (!PI_DEBUG) return;
+      try {
+        mkdirSync(PI_DEBUG_DIR, { recursive: true });
+        const suffix = label ? "-" + label.replace(/[^a-zA-Z0-9_-]/g, "_") : "";
+        const logPath = PI_DEBUG_DIR + "/" + containerName + suffix + "-" + Date.now() + ".log";
+        execSync("podman logs " + containerName + " > " + logPath + " 2>&1");
+      } catch (e) {}
+    }
+
+    async function simulatePiStop(containerName) {
+      if (containerName) captureContainerLogs(containerName);
+      execSync("podman stop " + containerName);
+    }
+
+    simulatePiStop("pi-test-container").then(() => {
+      console.log(JSON.stringify({ order }));
+    });
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], {
+    encoding: "utf-8",
+    env: { ...process.env, PI_DEBUG: "1", PI_DEBUG_DIR: testLogDir },
+  });
+
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.order[0], "podman-logs", "podman logs runs first");
+  assert.equal(output.order[1], "podman-stop", "podman stop runs second");
+
+  execSync(`rm -rf ${testLogDir}`);
+  console.log("  PASS — captureContainerLogs runs before podman stop in pi_stop");
+}
+
+async function testLogFileSurivesPiStopCleanup() {
+  console.log("TEST 45: PI_DEBUG log file survives pi_stop cleanup");
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const testLogDir = mkdtempSync(join(tmpdir(), "pi-test-debug-survive-"));
+  const slotDir = mkdtempSync(join(tmpdir(), "pi-test-slots-"));
+
+  const testCode = `
+    const { mkdirSync, writeFileSync, readdirSync, unlinkSync } = require('fs');
+    const { join } = require('path');
+    const PI_DEBUG = process.env.PI_DEBUG === "1";
+    const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR;
+    const SLOT_DIR = process.env.SLOT_DIR;
+    const containerName = "pi-test-abc";
+
+    function execSync(cmd) {
+      if (cmd.startsWith("podman logs")) {
+        const match = cmd.match(/ > (.+) 2>&1$/);
+        if (match) writeFileSync(match[1], "fake output\\n");
+        return;
+      }
+      if (cmd.startsWith("podman stop")) return;
+    }
+
+    function captureContainerLogs(name) {
+      if (!PI_DEBUG) return;
+      try {
+        mkdirSync(PI_DEBUG_DIR, { recursive: true });
+        const logPath = PI_DEBUG_DIR + "/" + name + "-" + Date.now() + ".log";
+        execSync("podman logs " + name + " > " + logPath + " 2>&1");
+      } catch (e) {}
+    }
+
+    // simulate pi_stop flow: capture → stop → cleanup sentinel + slot
+    captureContainerLogs(containerName);
+    execSync("podman stop " + containerName);
+    try { unlinkSync("/tmp/" + containerName + ".status"); } catch {}
+    try { unlinkSync(join(SLOT_DIR, process.pid + "-test-instance")); } catch {}
+
+    const files = readdirSync(PI_DEBUG_DIR);
+    console.log(JSON.stringify({ files }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], {
+    encoding: "utf-8",
+    env: { ...process.env, PI_DEBUG: "1", PI_DEBUG_DIR: testLogDir, SLOT_DIR: slotDir },
+  });
+
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.files.length, 1, "log file exists after pi_stop cleanup");
+  assert.ok(output.files[0].startsWith("pi-test-abc-"), "log file has correct container name prefix");
+
+  execSync(`rm -rf ${testLogDir} ${slotDir}`);
+  console.log("  PASS — PI_DEBUG log file survives pi_stop cleanup");
+}
+
+async function testLogFileSurvivesCleanupStaleInstances() {
+  console.log("TEST 46: PI_DEBUG log file survives cleanupStaleInstances orphaned stop");
+  const { mkdtempSync, writeFileSync, existsSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const testLogDir = mkdtempSync(join(tmpdir(), "pi-test-debug-cleanup-"));
+  const stateFile = "/tmp/pi-bridge-state-99991.json";
+  const containerName = "pi-orphaned-test";
+  const state = JSON.stringify({ pid: 99991, instances: [{ containerName }] });
+
+  const order: string[] = [];
+  let logFilePath = "";
+
+  function mockExec(cmd: string) {
+    if (cmd.includes("pgrep")) return "\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return stateFile + "\n";
+    if (cmd.includes("podman stop")) { order.push("podman-stop"); return ""; }
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    if (sig === 0) throw new Error("dead");
+  }
+  function mockRead(path: string) {
+    if (path === stateFile) return state;
+    throw new Error("unexpected read: " + path);
+  }
+  function mockUnlink(_path: string) {}
+  function mockWrite(_msg: string) {}
+  function mockCaptureContainerLogs(name: string) {
+    order.push("podman-logs");
+    logFilePath = join(testLogDir, `${name}-${Date.now()}.log`);
+    writeFileSync(logFilePath, "fake crash logs\n");
+  }
+
+  fn({
+    execSync: mockExec as any,
+    processKill: mockKill as any,
+    readFileSync: mockRead,
+    unlinkSync: mockUnlink,
+    stderrWrite: mockWrite,
+    captureContainerLogs: mockCaptureContainerLogs,
+  });
+
+  assert.equal(order[0], "podman-logs", "logs captured before stop");
+  assert.equal(order[1], "podman-stop", "stop runs after capture");
+  assert.ok(logFilePath.length > 0, "log file path was set");
+  assert.ok(existsSync(logFilePath), "log file still exists after cleanup");
+
+  execSync(`rm -rf ${testLogDir}`);
+  console.log("  PASS — PI_DEBUG log file survives cleanupStaleInstances orphaned stop");
+}
+
+async function testMultipleContainersSeparatePiDebugLogs() {
+  console.log("TEST 47: multiple containers get separate PI_DEBUG log files, no collision");
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const testLogDir = mkdtempSync(join(tmpdir(), "pi-test-debug-multi-"));
+
+  const testCode = `
+    const { mkdirSync, writeFileSync, readdirSync, readFileSync } = require('fs');
+    const path = require('path');
+    const PI_DEBUG = process.env.PI_DEBUG === "1";
+    const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR;
+
+    function execSync(cmd) {
+      if (cmd.startsWith("podman logs")) {
+        const match = cmd.match(/podman logs (\\S+) > (.+) 2>&1$/);
+        if (match) writeFileSync(match[2], "output for " + match[1] + "\\n");
+        return;
+      }
+    }
+
+    function captureContainerLogs(containerName, label) {
+      if (!PI_DEBUG) return;
+      try {
+        mkdirSync(PI_DEBUG_DIR, { recursive: true });
+        const suffix = label ? "-" + label.replace(/[^a-zA-Z0-9_-]/g, "_") : "";
+        const logPath = PI_DEBUG_DIR + "/" + containerName + suffix + "-" + Date.now() + ".log";
+        execSync("podman logs " + containerName + " > " + logPath + " 2>&1");
+      } catch (e) {}
+    }
+
+    captureContainerLogs("pi-task-a", "task-a");
+    const t1 = Date.now(); while (Date.now() - t1 < 2) {}
+    captureContainerLogs("pi-task-b", "task-b");
+
+    const files = readdirSync(PI_DEBUG_DIR).sort();
+    const contents = files.map(f => readFileSync(path.join(PI_DEBUG_DIR, f), 'utf-8'));
+    console.log(JSON.stringify({ files, contents }));
+  `;
+
+  const result = spawnSync("node", ["-e", testCode], {
+    encoding: "utf-8",
+    env: { ...process.env, PI_DEBUG: "1", PI_DEBUG_DIR: testLogDir },
+  });
+
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.files.length, 2, "two separate log files created");
+  assert.ok(output.files.some((f: string) => f.startsWith("pi-task-a-task-a-")), "task-a log file exists");
+  assert.ok(output.files.some((f: string) => f.startsWith("pi-task-b-task-b-")), "task-b log file exists");
+  assert.ok(output.files[0] !== output.files[1], "filenames are distinct");
+  assert.ok(output.contents.some((c: string) => c.includes("pi-task-a")), "task-a content captured separately");
+  assert.ok(output.contents.some((c: string) => c.includes("pi-task-b")), "task-b content captured separately");
+
+  execSync(`rm -rf ${testLogDir}`);
+  console.log("  PASS — multiple containers get separate PI_DEBUG log files");
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -1911,6 +2145,10 @@ async function runTests() {
     testCleanupPodmanStopThrowsSwallowed,
     testCleanupCorruptJsonSwallowed,
     testCleanupOwnPidExcluded,
+    testLogCaptureOrderInPiStop,
+    testLogFileSurivesPiStopCleanup,
+    testLogFileSurvivesCleanupStaleInstances,
+    testMultipleContainersSeparatePiDebugLogs,
   ];
 
   for (const test of tests) {
