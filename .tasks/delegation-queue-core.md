@@ -3,6 +3,7 @@ column: Done
 order: 10
 created: 2026-04-21
 parent: local-agent-delegation-queue
+updated: true
 ---
 
 # Delegation queue: Core data structures

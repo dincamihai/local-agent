@@ -3,6 +3,7 @@ column: Done
 order: 30
 created: 2026-04-21
 parent: local-agent-delegation-queue
+updated: true
 ---
 
 # Delegation queue: Agent worker loop

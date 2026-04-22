@@ -1,5 +1,13 @@
 ---
-column: Backlog
+column: Done
+title: local-agent: handle cancelled delegation_status
+updated: true
+delegation_status:
+delegation_status: 
+---
+
+---
+column: Done
 title: local-agent: handle cancelled delegation_status
 ---
 
@@ -32,3 +40,7 @@ Write tests BEFORE implementation:
 - `local-agent/scanner.test.ts`
 
 ## Result
+
+- Added cancelled task handling to `scanReposForDelegation()` — calls `list_delegated_tasks("cancelled")`, finds matching queued tasks, calls `queueCancel()`, clears frontmatter
+- Added `test_scanner_cancelled_clears_frontmatter` to scanner.test.ts
+- All scanner tests: 7 passed

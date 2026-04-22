@@ -1,6 +1,8 @@
 ---
-column: Backlog
+column: Done
 title: local-agent: implement repo scanner for delegated tasks
+delegation_status: processing
+updated: true
 ---
 
 # local-agent: implement repo scanner for delegated tasks

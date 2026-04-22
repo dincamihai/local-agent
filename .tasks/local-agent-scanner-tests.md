@@ -1,5 +1,12 @@
 ---
-column: Backlog
+column: Done
+title: local-agent: add tests for repo scanner
+updated: true
+delegation_status: processing
+---
+
+---
+column: Done
 title: local-agent: add tests for repo scanner
 ---
 
@@ -25,3 +32,10 @@ Add unit/integration tests for scanner functionality.
 - Use tmpdir for mock task cards
 
 ## Result
+
+- scanner.test.ts now has 7 tests:
+  - 4 original MCP wrapper tests (spawn, list, setFrontmatter, close)
+  - 2 syncTaskCard tests (update frontmatter + body, append to existing Result)
+  - 1 cancelled handling test (clear frontmatter)
+- All pass (7/7)
+- mock-board-tui-tests.js supports get_task and update_task

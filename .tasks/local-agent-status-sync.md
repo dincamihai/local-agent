@@ -1,5 +1,11 @@
 ---
-column: Backlog
+column: Done
+title: local-agent: sync delegation status back to task cards
+updated: true
+---
+
+---
+column: Done
 title: local-agent: sync delegation status back to task cards
 ---
 
@@ -31,3 +37,9 @@ Write tests BEFORE implementation:
 - `local-agent/scanner.test.ts`
 
 ## Result
+
+- Added `syncTaskCard(repoDir, slug, status, resultText?)` helper — updates frontmatter + appends result to `## Result` section via `get_task` + `update_task` MCP tools
+- Implemented `processQueueTask(task)` — runs pi agent, updates queue, syncs result back to card
+- Added mock-board-tui-tests.js support for `get_task` and `update_task`
+- Added 2 TDD tests for syncTaskCard (new frontmatter, append to existing Result)
+- All scanner tests: 7 passed

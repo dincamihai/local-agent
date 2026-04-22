@@ -1,14 +1,11 @@
 ---
 column: Backlog
 title: Create membrain extension to replace LanceDB memory backend
----
-
-# Create membrain extension to replace LanceDB memory backend
----
-column: backlog
 parent: local-agent-delegation-queue
 depends_on: []
 ---
+
+# Create membrain extension to replace LanceDB memory backend
 
 ## Goal (DONE)
 
