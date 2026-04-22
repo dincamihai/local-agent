@@ -11,14 +11,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn, execSync, type ChildProcess } from "child_process";
 import { writeFileSync, readFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from "fs";
 import { StringDecoder } from "string_decoder";
 import { basename, dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { openQueue, queueAdd, queueClaim, queueComplete, queueFail, queueCancel, queueGet, queueList, type QueueTask } from "./queue.js";
 
 export const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -33,13 +30,10 @@ export const LOCAL_AGENT_DIR = process.env.PI_LOCAL_AGENT_DIR ?? SCRIPT_DIR;
 export const OUTPUT_DIR = process.env.PI_OUTPUT_DIR ?? join(LOCAL_AGENT_DIR, "output");
 const STATE_FILE = process.env.PI_STATE_FILE ?? `/tmp/pi-bridge-state-${process.pid}.json`;
 const PARALLEL_LIMIT = parseInt(process.env.PARALLEL_LIMIT ?? "1", 10);
-const QUEUE_POLL_INTERVAL = parseInt(process.env.QUEUE_POLL_INTERVAL ?? "5000", 10);
-const QUEUE_TASK_TIMEOUT = parseInt(process.env.QUEUE_TASK_TIMEOUT ?? "1800000", 10); // 30min default
 const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 const PI_DEBUG = process.env.PI_DEBUG === "1";
 const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR ?? "/tmp/pi-bridge-logs";
 const REMOTE_DELEGATION = process.env.REMOTE_DELEGATION === "1";
-const BOARD_TASKS_DIR = process.env.BOARD_TASKS_DIR ?? join(process.cwd(), ".tasks");
 
 function captureContainerLogs(containerName: string, label?: string): void {
   if (!PI_DEBUG) return;
@@ -777,8 +771,6 @@ export function cleanupStaleInstances(deps?: CleanupDeps): void {
 
 cleanupStaleInstances();
 
-const db = openQueue();
-
 const server = new McpServer({
   name: "pi-bridge",
   version: "1.0.0",
@@ -1163,30 +1155,6 @@ server.tool(
   }
 );
 
-// -- Model tools --
-
-server.tool(
-  "pi_set_model",
-  "Switch the agent to a different model mid-session.",
-  {
-    provider: z.string().describe("Provider name (e.g. 'ollama')"),
-    model: z.string().describe("Model ID (e.g. 'gemma4', 'devstral')"),
-    instance_id: INSTANCE_ID_PARAM,
-  },
-  async ({ provider, model, instance_id }) => {
-    const client = getInstance(instance_id);
-    if (!client?.isRunning) {
-      return { content: [{ type: "text", text: "Pi agent not running." }], isError: true };
-    }
-    try {
-      const result = await client.setModel(provider, model);
-      return { content: [{ type: "text", text: `Model set to ${JSON.stringify(result)}` }] };
-    } catch (e: any) {
-      return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
-    }
-  }
-);
-
 // -- Context tools --
 
 server.tool(
@@ -1211,349 +1179,6 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
-// Queue MCP tools
-// ---------------------------------------------------------------------------
-
-server.tool(
-  "queue_add",
-  "Add a task to the delegation queue. The worker loop will pick it up and run it with a local pi agent. Returns a task ID you can use with queue_status.",
-  {
-    prompt: z.string().describe("The task or prompt for the agent to complete"),
-    workspace: z.string().optional().describe("Host repo directory to mount as context"),
-    task_file: z.string().optional().describe("Host path to a task .md file to mount as /task.md"),
-    task_slug: z.string().optional().describe("Short slug for the task (used in instance naming)"),
-  },
-  async ({ prompt, workspace, task_file, task_slug }) => {
-    const task = queueAdd(db, { prompt, workspace, taskFile: task_file, taskSlug: task_slug });
-    return { content: [{ type: "text", text: `Task queued. ID: ${task.id}\nStatus: queued\nMonitor: queue_status id="${task.id}"` }] };
-  }
-);
-
-server.tool(
-  "queue_list",
-  "List all tasks in the delegation queue, optionally filtered by status.",
-  {
-    status: z.enum(["queued", "processing", "done", "failed"]).optional().describe("Filter by status"),
-  },
-  async ({ status }) => {
-    const tasks = queueList(db, status);
-    if (tasks.length === 0) return { content: [{ type: "text", text: "No tasks." }] };
-    return { content: [{ type: "text", text: JSON.stringify(tasks, null, 2) }] };
-  }
-);
-
-server.tool(
-  "queue_status",
-  "Get the status and result of a specific queued task.",
-  { id: z.string().describe("Task ID from queue_add") },
-  async ({ id }) => {
-    const task = queueGet(db, id);
-    if (!task) return { content: [{ type: "text", text: `Task ${id} not found.` }], isError: true };
-    return { content: [{ type: "text", text: JSON.stringify(task, null, 2) }] };
-  }
-);
-
-server.tool(
-  "queue_cancel",
-  "Cancel a queued task (only works if status is 'queued' — cannot cancel in-progress tasks).",
-  { id: z.string().describe("Task ID to cancel") },
-  async ({ id }) => {
-    const cancelled = queueCancel(db, id);
-    if (!cancelled) {
-      const task = queueGet(db, id);
-      if (!task) return { content: [{ type: "text", text: `Task ${id} not found.` }], isError: true };
-      return { content: [{ type: "text", text: `Cannot cancel task in status '${task.status}'.` }], isError: true };
-    }
-    return { content: [{ type: "text", text: `Task ${id} cancelled.` }] };
-  }
-);
-
-// ---------------------------------------------------------------------------
-// Board-tui MCP client wrappers
-
-interface BoardTuiDelegatedTask {
-  slug: string;
-  body?: string;
-  column?: string;
-  [key: string]: unknown;
-}
-
-/**
- * Spawn a board-tui MCP client connected to the board-tui-mcp subprocess.
- * @param repoDir - Optional repo directory (passed as BOARD_TASKS_DIR env var)
- * @returns Connected Client instance
- */
-export async function spawnBoardTuiClient(repoDir?: string): Promise<Client> {
-  const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
-  const transport = new StdioClientTransport({
-    command: "board-tui-mcp",
-    env: { ...getDefaultEnvironment(), ...(repoDir ? { BOARD_TASKS_DIR: repoDir } : {}) },
-  });
-  await client.connect(transport);
-  process.stderr.write("[pi-bridge] board-tui: connected to board-tui-mcp\n");
-  return client;
-}
-
-/**
- * Call board-tui list_delegated_tasks MCP tool.
- * @param repoDir - Optional repo directory
- * @param status - Status filter (e.g., 'queued', 'done')
- * @returns Array of delegated tasks
- */
-export async function listDelegatedTasks(repoDir?: string, status?: string): Promise<BoardTuiDelegatedTask[]> {
-  const client = await spawnBoardTuiClient(repoDir);
-  try {
-    const result = await client.callTool({
-      name: "list_delegated_tasks",
-      arguments: { status: status ?? "queued" },
-    });
-    const taskText = result.content?.[0]?.type === "text" ? result.content[0].text : "[]";
-    let tasks: BoardTuiDelegatedTask[] = [];
-    try { tasks = JSON.parse(taskText); } catch { /* empty */ }
-    return tasks;
-  } finally {
-    await client.close();
-  }
-}
-
-/**
- * Call board-tui set_frontmatter MCP tool.
- * @param repoDir - Optional repo directory
- * @param slug - Task card slug
- * @param key - Frontmatter key
- * @param value - Frontmatter value
- */
-export async function setFrontmatter(repoDir: string, slug: string, key: string, value: string): Promise<void> {
-  const client = await spawnBoardTuiClient(repoDir);
-  try {
-    await client.callTool({
-      name: "set_frontmatter",
-      arguments: { slug, key, value },
-    });
-  } finally {
-    await client.close();
-  }
-}
-
-// Board-tui delegation scanner
-// ---------------------------------------------------------------------------
-
-/**
- * Scans board-tui for queued delegation tasks and enqueues them into the
- * local-agent queue. Called every QUEUE_POLL_INTERVAL from the worker loop.
- *
- * 1. Spawns board-tui MCP client via stdio
- * 2. Calls list_delegated_tasks("queued")
- * 3. For each task: queueAdd(), set_frontmatter(slug, "delegation_status", "processing")
- * 4. Closes MCP client
- */
-export async function scanReposForDelegation(queueDb: ReturnType<typeof openQueue> = db, repoDir?: string): Promise<void> {
-  const tasksDir = repoDir ?? BOARD_TASKS_DIR;
-  const client = new Client({ name: "pi-bridge-scanner", version: "1.0.0" });
-  const transport = new StdioClientTransport({
-    command: "board-tui-mcp",
-    env: { ...getDefaultEnvironment(), BOARD_TASKS_DIR: tasksDir },
-  });
-
-  try {
-    await client.connect(transport);
-    process.stderr.write("[pi-bridge] scanner: connected to board-tui-mcp\n");
-
-    // ---- Handle cancelled tasks first ----
-    const cancelledResult = await client.callTool({
-      name: "list_delegated_tasks",
-      arguments: { status: "cancelled" },
-    });
-    const cancelledText = cancelledResult.content?.[0]?.type === "text" ? cancelledResult.content[0].text : "[]";
-    let cancelledTasks: Array<{ slug: string }> = [];
-    try { cancelledTasks = JSON.parse(cancelledText); } catch { /* empty */ }
-
-    if (cancelledTasks.length > 0) {
-      process.stderr.write(`[pi-bridge] scanner: found ${cancelledTasks.length} cancelled task(s)\n`);
-      const queuedTasks = queueList(queueDb, "queued");
-      for (const ct of cancelledTasks) {
-        const match = queuedTasks.find(q => q.taskSlug === ct.slug);
-        if (match) {
-          queueCancel(queueDb, match.id);
-          process.stderr.write(`[pi-bridge] scanner: cancelled queued task ${ct.slug} (id ${match.id})\n`);
-        }
-        // Clear delegation_status frontmatter regardless of queue state
-        try {
-          await client.callTool({
-            name: "set_frontmatter",
-            arguments: { slug: ct.slug, key: "delegation_status", value: "" },
-          });
-          process.stderr.write(`[pi-bridge] scanner: cleared delegation_status for ${ct.slug}\n`);
-        } catch (e: any) {
-          process.stderr.write(`[pi-bridge] scanner: failed to clear frontmatter for ${ct.slug}: ${e.message}\n`);
-        }
-      }
-    }
-
-    // Call list_delegated_tasks("queued") to find queued delegation tasks
-    const result = await client.callTool({
-      name: "list_delegated_tasks",
-      arguments: { status: "queued" },
-    });
-
-    const taskText = result.content?.[0]?.type === "text" ? result.content[0].text : "[]";
-    let tasks: Array<{ slug: string; body?: string }> = [];
-    try {
-      tasks = JSON.parse(taskText);
-    } catch { /* empty results */ }
-
-    if (tasks.length === 0) {
-      process.stderr.write("[pi-bridge] scanner: no queued tasks found\n");
-      return;
-    }
-
-    process.stderr.write(`[pi-bridge] scanner: found ${tasks.length} queued task(s)\n`);
-
-    for (const task of tasks) {
-      // Skip if already enqueued (same slug exists in queue)
-      const existingSlugs = queueList(queueDb).map(t => t.taskSlug).filter(Boolean) as string[];
-      if (existingSlugs.includes(task.slug)) {
-        process.stderr.write(`[pi-bridge] scanner: skipping already-enqueued task: ${task.slug}\n`);
-        continue;
-      }
-
-      // Build prompt from task body (strip frontmatter if present)
-      let prompt: string | undefined;
-      if (task.body) {
-        const fmMatch = task.body.match(/^(---\n[\\s\\S]*?\n---)\\s*([\\s\\S]*)$/);
-        prompt = fmMatch ? fmMatch[2]?.trim() ?? task.body : task.body;
-      }
-
-      // Enqueue the task
-      queueAdd(queueDb, {
-        prompt: prompt ?? `Process delegation task: ${task.slug}`,
-        workspace: undefined,
-        taskFile: undefined,
-        taskSlug: task.slug,
-      });
-
-      // Update frontmatter: set delegation_status to processing
-      try {
-        await client.callTool({
-          name: "set_frontmatter",
-          arguments: { slug: task.slug, key: "delegation_status", value: "processing" },
-        });
-        process.stderr.write(`[pi-bridge] scanner: enqueued task ${task.slug} → processing\n`);
-      } catch (e: any) {
-        process.stderr.write(`[pi-bridge] scanner: failed to set frontmatter for ${task.slug}: ${e.message}\n`);
-      }
-    }
-
-  } catch (e: any) {
-    process.stderr.write(`[pi-bridge] scanner: error — ${e.message}\n`);
-  } finally {
-    await transport.close();
-    process.stderr.write("[pi-bridge] scanner: board-tui-mcp client closed\n");
-  }
-}
-
-/**
- * Sync delegation status back to the originating task card via board-tui MCP.
- * Updates frontmatter and appends result to the ## Result section.
- */
-export async function syncTaskCard(
-  repoDir: string,
-  slug: string,
-  status: string,
-  resultText?: string,
-): Promise<void> {
-  const client = await spawnBoardTuiClient(repoDir);
-  try {
-    // Update frontmatter status
-    await client.callTool({
-      name: "set_frontmatter",
-      arguments: { slug, key: "delegation_status", value: status },
-    });
-
-    // Append result to body if provided
-    if (resultText) {
-      const getResult = await client.callTool({
-        name: "get_task",
-        arguments: { slug },
-      });
-      const taskData = getResult.content?.[0]?.type === "text"
-        ? JSON.parse(getResult.content[0].text)
-        : null;
-      const body: string = taskData?.body ?? "";
-
-      let newBody: string;
-      if (body.includes("## Result")) {
-        newBody = body + `\n\n**${status.toUpperCase()}** @ ${new Date().toISOString()}\n\n${resultText}\n`;
-      } else {
-        newBody = body + `\n\n## Result\n\n**${status.toUpperCase()}** @ ${new Date().toISOString()}\n\n${resultText}\n`;
-      }
-
-      await client.callTool({
-        name: "update_task",
-        arguments: { slug, body: newBody },
-      });
-    }
-  } finally {
-    await client.close();
-  }
-}
-
-/**
- * Process a single queue task: start pi agent, run prompt, update queue and card.
- */
-export async function processQueueTask(task: QueueTask, piClient?: PiRpcClient, queueDb: ReturnType<typeof openQueue> = db, repoDir?: string): Promise<void> {
-  const instanceId = `queue-${task.id.slice(0, 8)}`;
-  const client = piClient ?? new PiRpcClient();
-  const cardDir = repoDir ?? BOARD_TASKS_DIR;
-
-  try {
-    const workspace = task.workspace ?? LOCAL_AGENT_DIR;
-    await client.start(workspace, task.taskFile ?? undefined, undefined, instanceId);
-    await client.ensureReady();
-    await client.prompt(task.prompt);
-    await client.waitForIdle(QUEUE_TASK_TIMEOUT);
-    const result = client.getResult();
-
-    queueComplete(queueDb, task.id, result ?? "");
-    if (task.taskSlug) {
-      await syncTaskCard(cardDir, task.taskSlug, "done", result ?? undefined).catch(() => {});
-    }
-  } catch (e: any) {
-    queueFail(queueDb, task.id, e.message);
-    if (task.taskSlug) {
-      await syncTaskCard(cardDir, task.taskSlug, "failed", e.message).catch(() => {});
-    }
-  } finally {
-    await client.stop();
-    releaseGlobalSlot(instanceId);
-  }
-}
-
-async function workerTick(): Promise<void> {
-  // Scan board-tui task dir for queued delegation tasks (non-blocking)
-  scanReposForDelegation(db).catch(() => {});
-
-  // Cheap local check first — avoids touching the slot dir every 5s when busy
-  if (instances.size >= PARALLEL_LIMIT) return;
-
-  const task = queueClaim(db, `worker-${process.pid}`);
-  if (!task) return;
-
-  const instanceId = `queue-${task.id.slice(0, 8)}`;
-
-  // Acquire machine-wide slot; if at limit, put task back and bail
-  if (!acquireGlobalSlot(instanceId)) {
-    // Re-queue: reset status back to queued so another worker can pick it up
-    try {
-      db.prepare(`UPDATE tasks SET status='queued', agent_id=NULL, started_at=NULL WHERE id=?`).run(task.id);
-    } catch {}
-    return;
-  }
-
-  processQueueTask(task).catch(() => {});
-}
-
-// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
@@ -1561,7 +1186,6 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write("pi-bridge MCP server running (stdio)\n");
-  setInterval(() => { workerTick().catch(() => {}); }, QUEUE_POLL_INTERVAL);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
