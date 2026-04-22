@@ -231,32 +231,40 @@ class PiRpcClient {
     return this.logBuffer.join("\n");
   }
 
-  async start(workDir?: string, taskFile?: string, editDir?: string, name?: string): Promise<void> {
+  async start(contextDir?: string, taskFile?: string, editDir?: string, name?: string): Promise<void> {
     if (this.proc) return;
 
     this.containerName = name ?? `pi-agent-${Date.now()}`;
 
-    // Auto-create a git worktree if workDir is a git repo and no editDir was passed
-    if (workDir && !editDir && (() => { try { execSync(`git -C ${workDir} rev-parse --git-dir`, {stdio:"ignore"}); return true; } catch { return false; } })()) {
-      let worktreePath: string | undefined;
+    // Auto-create a git worktree if contextDir is a git repo and no editDir was passed
+    let worktreePath: string | undefined;
+    if (contextDir && !editDir && (() => { try { execSync(`git -C ${contextDir} rev-parse --git-dir`, {stdio:"ignore"}); return true; } catch { return false; } })()) {
       try {
         const branch = `pi/${name}-${Date.now()}`;
-        const repoName = getRepoName(workDir);
+        const repoName = getRepoName(contextDir);
         worktreePath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
         execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
-        execSync(`git -C ${workDir} worktree add ${worktreePath} -b ${branch}`);
+        execSync(`git -C ${contextDir} worktree add ${worktreePath} -b ${branch}`);
         this.worktreePath = worktreePath;
-        this.worktreeWorkDir = workDir;
+        this.worktreeWorkDir = contextDir;
         this.worktreeBranch = branch;
-        editDir = worktreePath;
       } catch (e: any) {
         process.stderr.write(`[pi-bridge] worktree creation failed, no write mount: ${e.message}\n`);
       }
     }
 
     const mounts: string[] = [];
-    if (workDir) mounts.push("-v", `${workDir}:/context:ro`);
-    if (editDir) mounts.push("-v", `${editDir}:/workspace:rw`);
+    // Only one repo mount active at a time
+    if (worktreePath) {
+      // Worktree active — single writeable mount, NO /context
+      mounts.push("-v", `${worktreePath}:/workspace:rw`);
+    } else if (editDir) {
+      // Explicit editdir (deprecated)
+      mounts.push("-v", `${editDir}:/workspace:rw`);
+    } else if (contextDir) {
+      // Read-only fallback
+      mounts.push("-v", `${contextDir}:/context:ro`);
+    }
     if (taskFile) mounts.push("-v", `${taskFile}:/task.md:rw`);
     mounts.push("-v", `${OUTPUT_DIR}:/output`);
 
@@ -748,9 +756,9 @@ const INSTANCE_ID_PARAM = z.string().optional().describe("Instance ID from pi_st
 
 server.tool(
   "pi_start",
-  `Start a pi agent instance. Returns an instance_id to use with other pi_ tools. Supports up to PARALLEL_LIMIT (currently ${PARALLEL_LIMIT}) concurrent agents. Mounts: /context (read-only repo reference), /workspace (read-write, auto-created git worktree or explicit editdir), /task.md (task card). Agent edits go to /workspace — never touches /context.`,
+  `Start a pi agent instance. Returns an instance_id to use with other pi_ tools. Supports up to PARALLEL_LIMIT (currently ${PARALLEL_LIMIT}) concurrent agents. Mounts: /workspace (read-write, auto-created git worktree or explicit editdir) OR /context (read-only repo reference), /task.md (task card). Only one repo mount active at a time.`,
   {
-    workspace: z.string().optional().describe("Host repo directory — mounted read-only at /context. If it is a git repo, a worktree is auto-created and mounted read-write at /workspace."),
+    workspace: z.string().optional().describe("Host repo directory — mounted read-only at /context. If it is a git repo, a worktree is auto-created and mounted read-write at /workspace (skipping /context)."),
     task: z.string().optional().describe("Host path to a task .md file to mount as /task.md (read-write)"),
     editdir: z.string().optional().describe("(Deprecated) Explicit host directory to mount as /workspace (read-write). Overrides auto-worktree. Only use when workspace is not a git repo."),
   },
