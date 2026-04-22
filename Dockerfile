@@ -2,6 +2,7 @@ FROM node:20-slim
 RUN apt-get update && apt-get install -y \
     python3 python3-pip cmake build-essential \
     libopenblas-dev liblapack-dev libx11-dev \
+    git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages face_recognition opencv-python-headless numpy pygame
 RUN npm install -g @mariozechner/pi-coding-agent

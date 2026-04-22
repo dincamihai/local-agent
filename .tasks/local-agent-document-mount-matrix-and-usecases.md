@@ -11,7 +11,7 @@ Single reference for how container mounts work across all local-agent modes.
 
 ## Status
 
-Reflects intended state after `local-agent-simplify-mounts-for-agents-single-workspace-path` fix.
+Implemented in commit `be1fa4a`. `pi-bridge-mcp.ts` now enforces single mount.
 
 ## Mount matrix
 
@@ -71,7 +71,7 @@ Mounts:
 
 Container runs `git clone` internally to `/workspace`. Agent edits at `/workspace`. Auto-push on exit.
 
-## Container mount construction (after fix)
+## Container mount construction
 
 ```ts
 const mounts: string[] = [];
@@ -84,9 +84,9 @@ if (repoUrl) {
 } else if (editDir) {
   // Explicit editdir mode
   mounts.push("-v", `${editDir}:/workspace:rw`);
-} else if (workDir) {
+} else if (contextDir) {
   // Read-only mode
-  mounts.push("-v", `${workDir}:/context:ro`);
+  mounts.push("-v", `${contextDir}:/context:ro`);
 }
 
 // Always mount output directory

@@ -36,6 +36,7 @@ const QUEUE_TASK_TIMEOUT = parseInt(process.env.QUEUE_TASK_TIMEOUT ?? "1800000",
 const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 const PI_DEBUG = process.env.PI_DEBUG === "1";
 const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR ?? "/tmp/pi-bridge-logs";
+const REMOTE_DELEGATION = process.env.REMOTE_DELEGATION === "1";
 
 function captureContainerLogs(containerName: string, label?: string): void {
   if (!PI_DEBUG) return;
@@ -312,6 +313,75 @@ class PiRpcClient {
     });
 
     // Spawn only — caller must await ensureReady() before prompting
+  }
+
+  async startRemote(repoUrl: string, branch: string, taskFile?: string, name?: string, extraEnv: string[] = []): Promise<void> {
+    if (this.proc) return;
+
+    this.containerName = name ?? `pi-agent-${Date.now()}`;
+
+    const mounts: string[] = [];
+    if (taskFile) mounts.push("-v", `${taskFile}:/task.md:rw`);
+    mounts.push("-v", `${OUTPUT_DIR}:/output`);
+
+    // Credential mounts
+    mounts.push("--secret", "gh-token");
+    if (process.env.SSH_AUTH_SOCK) {
+      mounts.push("-v", `${process.env.SSH_AUTH_SOCK}:/ssh-agent`);
+    }
+
+    const envVars = [
+      "-e", `MEMORY_BACKEND=${process.env.MEMORY_BACKEND ?? "lance"}`,
+      "-e", `REPO_URL=${repoUrl}`,
+      "-e", `REPO_BRANCH=${branch}`,
+      ...extraEnv,
+    ];
+    if (process.env.SSH_AUTH_SOCK) {
+      envVars.push("-e", "SSH_AUTH_SOCK=/ssh-agent");
+    }
+
+    this.proc = spawn("podman", [
+      "run", "--rm", "-i",
+      "--name", this.containerName,
+      ...mounts,
+      ...envVars,
+      "-v", `${LOCAL_AGENT_DIR}/pi-models.json:/root/.pi/agent/models.json:ro`,
+      "-v", `${LOCAL_AGENT_DIR}/pi-settings.json:/root/.pi/agent/settings.json:ro`,
+      "-v", `${LOCAL_AGENT_DIR}/lance-extension.ts:/ext/lance-extension.ts:ro`,
+      "-v", `${LOCAL_AGENT_DIR}/membrain-extension.ts:/ext/membrain-extension.ts:ro`,
+      "--add-host=host.containers.internal:host-gateway",
+      "--add-host=host.docker.internal:host-gateway",
+      DOCKER_IMAGE,
+      "--mode", "rpc",
+      "--model", DEFAULT_MODEL,
+      "--no-session",
+      "--tools", "read,write,bash,grep,find",
+    ], { stdio: ["pipe", "pipe", "pipe"] });
+
+    // LF-only JSONL reader (not readline — it splits on U+2028/U+2029)
+    this.stopReading = attachJsonlReader(this.proc.stdout!, (line) => {
+      this.handleLine(line);
+    });
+
+    this.proc.stderr?.on("data", (chunk) => {
+      const msg = chunk.toString().trim();
+      if (msg) process.stderr.write(`[pi-stderr] ${msg}\n`);
+    });
+
+    this.proc.on("exit", (code) => {
+      this.proc = null;
+      this.containerName = null;
+      this._isStreaming = false;
+      this.onExit?.();
+      for (const [, req] of this.pending) {
+        req.reject(new Error(`pi process exited with code ${code}`));
+      }
+      this.pending.clear();
+      if (this.idlePromise) {
+        this.idlePromise.resolve();
+        this.idlePromise = null;
+      }
+    });
   }
 
   async ensureReady(maxWaitMs = 30_000): Promise<void> {
@@ -754,16 +824,65 @@ server.server.setRequestHandler(
 
 const INSTANCE_ID_PARAM = z.string().optional().describe("Instance ID from pi_start. Omit to target the last started instance.");
 
+
 server.tool(
   "pi_start",
-  `Start a pi agent instance. Returns an instance_id to use with other pi_ tools. Supports up to PARALLEL_LIMIT (currently ${PARALLEL_LIMIT}) concurrent agents. Mounts: /workspace (read-write, auto-created git worktree or explicit editdir) OR /context (read-only repo reference), /task.md (task card). Only one repo mount active at a time.`,
-  {
-    workspace: z.string().optional().describe("Host repo directory — mounted read-only at /context. If it is a git repo, a worktree is auto-created and mounted read-write at /workspace (skipping /context)."),
-    task: z.string().optional().describe("Host path to a task .md file to mount as /task.md (read-write)"),
-    editdir: z.string().optional().describe("(Deprecated) Explicit host directory to mount as /workspace (read-write). Overrides auto-worktree. Only use when workspace is not a git repo."),
-  },
-  async ({ workspace, task, editdir }) => {
+  `Start a pi agent instance. Returns an instance_id to use with other pi_ tools. Supports up to PARALLEL_LIMIT (currently ${PARALLEL_LIMIT}) concurrent agents. Mode: ${REMOTE_DELEGATION ? "REMOTE (container clones repo)" : "LOCAL (bind-mount workspace)"}.`,
+  REMOTE_DELEGATION
+    ? { repo_url: z.string(), repo_branch: z.string().optional(), task: z.string().optional() }
+    : { workspace: z.string().optional(), task: z.string().optional(), editdir: z.string().optional() },
+  async (args: any) => {
     try {
+      if (REMOTE_DELEGATION) {
+        // Remote mode: repo_url required, workspace/editdir not used
+        const { repo_url, repo_branch, task } = args;
+        if (!repo_url) {
+          return { content: [{ type: "text", text: "repo_url is required in REMOTE_DELEGATION mode." }], isError: true };
+        }
+
+        const instanceId = `pi-remote-${Date.now()}`;
+
+        if (!acquireGlobalSlot(instanceId)) {
+          return { content: [{ type: "text", text: `At machine-wide parallel limit (${PARALLEL_LIMIT}). Stop an existing instance first, or increase PARALLEL_LIMIT env var.` }], isError: true };
+        }
+
+        const client = new PiRpcClient();
+        instances.set(instanceId, client);
+
+        client.onAgentEnd = (error) => {
+          if (client.containerName) {
+            const sentinel = `/tmp/${client.containerName}.status`;
+            try { writeFileSync(sentinel, JSON.stringify({ done: true, error: error ?? null, ts: Date.now() })); } catch {}
+          }
+          saveState();
+          sendResourceUpdated("pi://agent/status");
+        };
+
+        client.onExit = () => {
+          instances.delete(instanceId);
+          releaseGlobalSlot(instanceId);
+          saveState();
+        };
+
+        // Build env vars for remote mode
+        const branch = repo_branch ?? `pi/remote-${Date.now()}`;
+        const envVars: string[] = [
+          `-e`, `REPO_URL=${repo_url}`,
+          `-e`, `REPO_BRANCH=${branch}`,
+        ];
+
+        await client.startRemote(repo_url, branch, task, instanceId, envVars);
+        saveState();
+
+        client.startLogTail(() => sendResourceUpdated("pi://logs/current"));
+        sendResourceUpdated("pi://logs/current");
+
+        const sentinel = `/tmp/${instanceId}.status`;
+        return { content: [{ type: "text", text: `Pi agent starting as remote instance '${instanceId}'. Repo: ${repo_url}, branch: ${branch}\n\nNon-blocking completion: watch sentinel file '${sentinel}'.\nMonitor command: until [ -f ${sentinel} ]; do sleep 1; done && cat ${sentinel}` }] };
+      }
+
+      // Local mode
+      const { workspace, task, editdir } = args;
       const taskSlug = task ? basename(task, ".md") : null;
       const workspaceBase = workspace ? basename(workspace) : null;
       const instanceId = `pi-${taskSlug ?? workspaceBase ?? Date.now()}`;
