@@ -75,6 +75,39 @@ function setFrontmatter(slug, key, value) {
   }
 }
 
+function getTask(slug) {
+  const filePath = join(TASKS_DIR, slug + ".md");
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    const fm = {};
+    let body = content;
+    if (fmMatch) {
+      body = content.slice(fmMatch[0].length).trim();
+      for (const line of fmMatch[1].split("\n")) {
+        const idx = line.indexOf(":");
+        if (idx > 0) fm[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+      }
+    }
+    return { slug, body, fm };
+  } catch {
+    return null;
+  }
+}
+
+function updateTask(slug, body) {
+  const filePath = join(TASKS_DIR, slug + ".md");
+  try {
+    let content = readFileSync(filePath, "utf-8");
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) return false;
+    writeFileSync(filePath, fmMatch[0] + "\n" + body + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 let initialized = false;
 
 async function main() {
@@ -127,6 +160,27 @@ async function main() {
               },
             },
           },
+          {
+            name: "get_task",
+            description: "Get task content by slug",
+            inputSchema: {
+              type: "object",
+              properties: {
+                slug: { type: "string" },
+              },
+            },
+          },
+          {
+            name: "update_task",
+            description: "Overwrite task body",
+            inputSchema: {
+              type: "object",
+              properties: {
+                slug: { type: "string" },
+                body: { type: "string" },
+              },
+            },
+          },
         ],
       });
       return;
@@ -154,6 +208,16 @@ async function main() {
               text: JSON.stringify({ updated, slug: args?.slug }),
             },
           ],
+        });
+      } else if (name === "get_task") {
+        const task = getTask(args?.slug);
+        respond(msg.id, {
+          content: [{ type: "text", text: JSON.stringify(task) }],
+        });
+      } else if (name === "update_task") {
+        const updated = updateTask(args?.slug, args?.body);
+        respond(msg.id, {
+          content: [{ type: "text", text: JSON.stringify({ updated, slug: args?.slug }) }],
         });
       } else {
         errorResp(msg.id, -1, "unknown tool: " + name);

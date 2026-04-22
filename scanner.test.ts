@@ -306,6 +306,173 @@ async function test_client_closes_cleanly() {
   cleanup([tasksDir]);
 }
 
+// ---- test 5: syncTaskCard updates frontmatter and appends result ------ -------- -------
+
+async function test_syncTaskCard_updates_frontmatter_and_body() {
+  console.log("TEST 5: syncTaskCard updates frontmatter and appends result to body");
+
+  const tasksDir = makeTempDir("pi-test-sync-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const taskSlug = "sync-card";
+  writeTaskCard(tasksDir, taskSlug, { delegation_status: "processing", column: "Backlog" }, "# Sync Card\nDo work");
+
+  try {
+    // Helper: create mock MCP client
+    async function callTool(name: string, args: Record<string, unknown>) {
+      const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
+      const mockPath = path.join(mockBinDir, "board-tui-mcp");
+      fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+      fs.chmodSync(mockPath, 0o755);
+
+      const transport = new StdioClientTransport({
+        command: "board-tui-mcp",
+        env: {
+          ...process.env,
+          PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+          BOARD_TASKS_DIR: tasksDir,
+        },
+      });
+      await client.connect(transport);
+      try {
+        const result = await client.callTool({ name, arguments: args });
+        return result;
+      } finally {
+        await client.close();
+      }
+    }
+
+    // Step 1: set_frontmatter to done
+    await callTool("set_frontmatter", { slug: taskSlug, key: "delegation_status", value: "done" });
+    let content = fs.readFileSync(path.join(tasksDir, `${taskSlug}.md`), "utf-8");
+    assert.ok(content.includes("delegation_status: done"), "frontmatter should be updated to done");
+
+    // Step 2: get_task to read body
+    const getResult = await callTool("get_task", { slug: taskSlug });
+    const taskData = getResult.content?.[0]?.type === "text" ? JSON.parse(getResult.content[0].text) : null;
+    const body: string = taskData?.body ?? "";
+    assert.ok(body.includes("# Sync Card"), "body should contain original content");
+
+    // Step 3: update_task with result appended
+    const newBody = body + "\n\n## Result\n\n**DONE** @ 2026-04-22T00:00:00.000Z\n\nTask completed successfully\n";
+    await callTool("update_task", { slug: taskSlug, body: newBody });
+
+    // Verify final file
+    content = fs.readFileSync(path.join(tasksDir, `${taskSlug}.md`), "utf-8");
+    assert.ok(content.includes("delegation_status: done"), "frontmatter should still be done");
+    assert.ok(content.includes("## Result"), "body should have Result section");
+    assert.ok(content.includes("Task completed successfully"), "body should have result text");
+
+    console.log("  PASS — syncTaskCard updates frontmatter and appends result");
+  } finally {
+    cleanup([tasksDir, mockBinDir]);
+  }
+}
+
+// ---- test 6: syncTaskCard appends to existing Result section ------ -------- --------
+
+async function test_syncTaskCard_appends_to_existing_result() {
+  console.log("TEST 6: syncTaskCard appends to existing Result section");
+
+  const tasksDir = makeTempDir("pi-test-sync2-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const taskSlug = "sync-card2";
+  writeTaskCard(tasksDir, taskSlug, { delegation_status: "processing", column: "Backlog" }, "# Sync Card 2\nDo work\n\n## Result\n\nInitial result\n");
+
+  try {
+    async function callTool(name: string, args: Record<string, unknown>) {
+      const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
+      const mockPath = path.join(mockBinDir, "board-tui-mcp");
+      fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+      fs.chmodSync(mockPath, 0o755);
+
+      const transport = new StdioClientTransport({
+        command: "board-tui-mcp",
+        env: {
+          ...process.env,
+          PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+          BOARD_TASKS_DIR: tasksDir,
+        },
+      });
+      await client.connect(transport);
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close();
+      }
+    }
+
+    const getResult = await callTool("get_task", { slug: taskSlug });
+    const taskData = getResult.content?.[0]?.type === "text" ? JSON.parse(getResult.content[0].text) : null;
+    const body: string = taskData?.body ?? "";
+
+    const newBody = body + "\n**FAILED** @ 2026-04-22T00:00:00.000Z\n\nError occurred\n";
+    await callTool("update_task", { slug: taskSlug, body: newBody });
+
+    const content = fs.readFileSync(path.join(tasksDir, `${taskSlug}.md`), "utf-8");
+    assert.ok(content.includes("Initial result"), "should preserve existing result");
+    assert.ok(content.includes("Error occurred"), "should append new result");
+
+    console.log("  PASS — syncTaskCard appends to existing Result section");
+  } finally {
+    cleanup([tasksDir, mockBinDir]);
+  }
+}
+
+// ---- test 7: scanner cancelled handling clears frontmatter ------ -------- -------
+
+async function test_scanner_cancelled_clears_frontmatter() {
+  console.log("TEST 7: scanner cancelled handling clears frontmatter");
+
+  const tasksDir = makeTempDir("pi-test-cancel-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  writeTaskCard(tasksDir, "cancel-me", { delegation_status: "cancelled", column: "Backlog" }, "# Cancel Me\nBody");
+  writeTaskCard(tasksDir, "keep-me", { delegation_status: "queued", column: "Backlog" }, "# Keep Me\nBody");
+
+  try {
+    const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
+    const mockPath = path.join(mockBinDir, "board-tui-mcp");
+    fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+    fs.chmodSync(mockPath, 0o755);
+
+    const transport = new StdioClientTransport({
+      command: "board-tui-mcp",
+      env: {
+        ...process.env,
+        PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+        BOARD_TASKS_DIR: tasksDir,
+      },
+    });
+    await client.connect(transport);
+    try {
+      // list_delegated_tasks("cancelled") should return cancel-me
+      const result = await client.callTool({
+        name: "list_delegated_tasks",
+        arguments: { status: "cancelled" },
+      });
+      const taskText = result.content?.[0]?.type === "text" ? result.content[0].text : "[]";
+      const tasks = JSON.parse(taskText);
+      assert.equal(tasks.length, 1, "should find 1 cancelled task");
+      assert.equal(tasks[0].slug, "cancel-me", "should be cancel-me");
+
+      // Simulate clearing frontmatter
+      await client.callTool({
+        name: "set_frontmatter",
+        arguments: { slug: "cancel-me", key: "delegation_status", value: "" },
+      });
+
+      const content = fs.readFileSync(path.join(tasksDir, "cancel-me.md"), "utf-8");
+      assert.ok(!content.includes("delegation_status: cancelled"), "should clear cancelled status");
+      assert.ok(content.includes("column: Backlog"), "should preserve other frontmatter");
+    } finally {
+      await client.close();
+    }
+
+    console.log("  PASS — scanner cancelled handling clears frontmatter");
+  } finally {
+    cleanup([tasksDir, mockBinDir]);
+  }
+}
+
 // ---- runner ------ ------ ------ ------ -------- ------- ------ --------- -------- ------- --
 
 async function runTests() {
@@ -318,6 +485,9 @@ async function runTests() {
     test_listDelegatedTasks_returns_tasks,
     test_setFrontmatter_updates_card,
     test_client_closes_cleanly,
+    test_syncTaskCard_updates_frontmatter_and_body,
+    test_syncTaskCard_appends_to_existing_result,
+    test_scanner_cancelled_clears_frontmatter,
   ];
 
   for (const test of tests) {

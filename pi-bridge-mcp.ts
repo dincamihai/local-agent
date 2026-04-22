@@ -1355,6 +1355,37 @@ export async function scanReposForDelegation(): Promise<void> {
     await client.connect(transport);
     process.stderr.write("[pi-bridge] scanner: connected to board-tui-mcp\n");
 
+    // ---- Handle cancelled tasks first ----
+    const cancelledResult = await client.callTool({
+      name: "list_delegated_tasks",
+      arguments: { status: "cancelled" },
+    });
+    const cancelledText = cancelledResult.content?.[0]?.type === "text" ? cancelledResult.content[0].text : "[]";
+    let cancelledTasks: Array<{ slug: string }> = [];
+    try { cancelledTasks = JSON.parse(cancelledText); } catch { /* empty */ }
+
+    if (cancelledTasks.length > 0) {
+      process.stderr.write(`[pi-bridge] scanner: found ${cancelledTasks.length} cancelled task(s)\n`);
+      const queuedTasks = queueList(db, "queued");
+      for (const ct of cancelledTasks) {
+        const match = queuedTasks.find(q => q.taskSlug === ct.slug);
+        if (match) {
+          queueCancel(db, match.id);
+          process.stderr.write(`[pi-bridge] scanner: cancelled queued task ${ct.slug} (id ${match.id})\n`);
+        }
+        // Clear delegation_status frontmatter regardless of queue state
+        try {
+          await client.callTool({
+            name: "set_frontmatter",
+            arguments: { slug: ct.slug, key: "delegation_status", value: "" },
+          });
+          process.stderr.write(`[pi-bridge] scanner: cleared delegation_status for ${ct.slug}\n`);
+        } catch (e: any) {
+          process.stderr.write(`[pi-bridge] scanner: failed to clear frontmatter for ${ct.slug}: ${e.message}\n`);
+        }
+      }
+    }
+
     // Call list_delegated_tasks("queued") to find queued delegation tasks
     const result = await client.callTool({
       name: "list_delegated_tasks",
@@ -1414,6 +1445,82 @@ export async function scanReposForDelegation(): Promise<void> {
   } finally {
     await transport.close();
     process.stderr.write("[pi-bridge] scanner: board-tui-mcp client closed\n");
+  }
+}
+
+/**
+ * Sync delegation status back to the originating task card via board-tui MCP.
+ * Updates frontmatter and appends result to the ## Result section.
+ */
+export async function syncTaskCard(
+  repoDir: string,
+  slug: string,
+  status: string,
+  resultText?: string,
+): Promise<void> {
+  const client = await spawnBoardTuiClient(repoDir);
+  try {
+    // Update frontmatter status
+    await client.callTool({
+      name: "set_frontmatter",
+      arguments: { slug, key: "delegation_status", value: status },
+    });
+
+    // Append result to body if provided
+    if (resultText) {
+      const getResult = await client.callTool({
+        name: "get_task",
+        arguments: { slug },
+      });
+      const taskData = getResult.content?.[0]?.type === "text"
+        ? JSON.parse(getResult.content[0].text)
+        : null;
+      const body: string = taskData?.body ?? "";
+
+      let newBody: string;
+      if (body.includes("## Result")) {
+        newBody = body + `\n\n**${status.toUpperCase()}** @ ${new Date().toISOString()}\n\n${resultText}\n`;
+      } else {
+        newBody = body + `\n\n## Result\n\n**${status.toUpperCase()}** @ ${new Date().toISOString()}\n\n${resultText}\n`;
+      }
+
+      await client.callTool({
+        name: "update_task",
+        arguments: { slug, body: newBody },
+      });
+    }
+  } finally {
+    await client.close();
+  }
+}
+
+/**
+ * Process a single queue task: start pi agent, run prompt, update queue and card.
+ */
+async function processQueueTask(task: QueueTask): Promise<void> {
+  const instanceId = `queue-${task.id.slice(0, 8)}`;
+  const client = new PiRpcClient();
+
+  try {
+    const workspace = task.workspace ?? LOCAL_AGENT_DIR;
+    await client.start(workspace, task.taskFile ?? undefined, undefined, instanceId);
+    await client.ensureReady();
+    await client.prompt(task.prompt);
+    await client.waitForIdle(QUEUE_TASK_TIMEOUT);
+    const result = client.getResult();
+
+    queueComplete(db, task.id, result ?? "");
+    if (task.taskSlug) {
+      await syncTaskCard(BOARD_TASKS_DIR, task.taskSlug, "done", result ?? undefined).catch(() => {});
+    }
+  } catch (e: any) {
+    queueFail(db, task.id, e.message);
+    if (task.taskSlug) {
+      await syncTaskCard(BOARD_TASKS_DIR, task.taskSlug, "failed", e.message).catch(() => {});
+    }
+  } finally {
+    await client.stop();
+    releaseGlobalSlot(instanceId);
   }
 }
 
