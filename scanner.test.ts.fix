@@ -64,9 +64,9 @@ async function test_spawnBoardTuiClient_starts_subprocess() {
     const transport = new StdioClientTransport({
       command: "board-tui-mcp",
       env: {
-        ...process.env,
-        BOARD_TASKS_DIR: tasksDir,
         PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+        BOARD_TASKS_DIR: tasksDir,
+        ...process.env,
       },
     });
     await client.connect(transport);
@@ -110,9 +110,9 @@ async function test_listDelegatedTasks_returns_tasks() {
       const transport = new StdioClientTransport({
         command: "board-tui-mcp",
         env: {
-          ...process.env,
           PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
           BOARD_TASKS_DIR: tasksDir,
+          ...process.env,
         },
       });
       await client.connect(transport);
@@ -174,9 +174,9 @@ async function test_setFrontmatter_updates_card() {
       const transport = new StdioClientTransport({
         command: "board-tui-mcp",
         env: {
-          ...process.env,
           PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
           BOARD_TASKS_DIR: tasksDir,
+          ...process.env,
         },
       });
       await client.connect(transport);
@@ -227,9 +227,9 @@ async function test_client_closes_cleanly() {
   {
     const mockBinDir = createMockWithWrapper();
     const env = {
-      ...process.env,
       PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
       BOARD_TASKS_DIR: tasksDir,
+      ...process.env,
     };
     try {
       const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
@@ -258,9 +258,9 @@ async function test_client_closes_cleanly() {
   {
     const mockBinDir = createMockWithWrapper();
     const env = {
-      ...process.env,
       PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
       BOARD_TASKS_DIR: tasksDir,
+      ...process.env,
     };
     const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
     const transport = new StdioClientTransport({ command: "board-tui-mcp", env });
@@ -284,9 +284,9 @@ async function test_client_closes_cleanly() {
   for (let i = 0; i < 3; i++) {
     const mockBinDir = createMockWithWrapper();
     const env = {
-      ...process.env,
       PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
       BOARD_TASKS_DIR: tasksDir,
+      ...process.env,
     };
     try {
       const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });

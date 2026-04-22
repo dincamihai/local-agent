@@ -1266,60 +1266,72 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
-// Queue worker
-// ---------------------------------------------------------------------------
+// Board-tui MCP client wrappers
 
-async function processQueueTask(task: QueueTask): Promise<void> {
-  const instanceId = `queue-${task.id.slice(0, 8)}`;
-  const client = new PiRpcClient();
-  instances.set(instanceId, client);
+interface BoardTuiDelegatedTask {
+  slug: string;
+  body?: string;
+  column?: string;
+  [key: string]: unknown;
+}
 
-  client.onAgentEnd = (error) => {
-    if (client.containerName) {
-      const sentinel = `/tmp/${client.containerName}.status`;
-      try { writeFileSync(sentinel, JSON.stringify({ done: true, error: error ?? null, ts: Date.now() })); } catch {}
-    }
-    saveState();
-    sendResourceUpdated("pi://agent/status");
-  };
+/**
+ * Spawn a board-tui MCP client connected to the board-tui-mcp subprocess.
+ * @param repoDir - Optional repo directory (passed as BOARD_TASKS_DIR env var)
+ * @returns Connected Client instance
+ */
+export async function spawnBoardTuiClient(repoDir?: string): Promise<Client> {
+  const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: "board-tui-mcp",
+    env: { ...getDefaultEnvironment(), ...(repoDir ? { BOARD_TASKS_DIR: repoDir } : {}) },
+  });
+  await client.connect(transport);
+  process.stderr.write("[pi-bridge] board-tui: connected to board-tui-mcp\n");
+  return client;
+}
 
-  client.onExit = () => {
-    instances.delete(instanceId);
-    releaseGlobalSlot(instanceId);
-    saveState();
-  };
-
+/**
+ * Call board-tui list_delegated_tasks MCP tool.
+ * @param repoDir - Optional repo directory
+ * @param status - Status filter (e.g., 'queued', 'done')
+ * @returns Array of delegated tasks
+ */
+export async function listDelegatedTasks(repoDir?: string, status?: string): Promise<BoardTuiDelegatedTask[]> {
+  const client = await spawnBoardTuiClient(repoDir);
   try {
-    await client.start(task.workspace ?? undefined, task.taskFile ?? undefined, undefined, instanceId);
-    client.startLogTail(() => sendResourceUpdated("pi://logs/current"));
-    saveState();
-    await client.ensureReady();
-    await client.prompt(task.prompt);
-    await client.waitForIdle(QUEUE_TASK_TIMEOUT);
-    const result = client.getResult();
-
-    // Auto-merge worktree before stopping container
-    const mergeResult = client.mergeWorktree(`pi: agent changes for ${task.taskSlug ?? task.id}`);
-    const mergeFailed = mergeResult.includes("Merge failed");
-
-    if (mergeFailed) {
-      queueFail(db, task.id, `Agent completed but merge failed:\n${mergeResult}\n\nWorktree preserved for manual merge.`);
-    } else {
-      queueComplete(db, task.id, result ?? "(no output)");
-    }
-  } catch (e: any) {
-    queueFail(db, task.id, e.message);
+    const result = await client.callTool({
+      name: "list_delegated_tasks",
+      arguments: { status: status ?? "queued" },
+    });
+    const taskText = result.content?.[0]?.type === "text" ? result.content[0].text : "[]";
+    let tasks: BoardTuiDelegatedTask[] = [];
+    try { tasks = JSON.parse(taskText); } catch { /* empty */ }
+    return tasks;
   } finally {
-    if (client.containerName) captureContainerLogs(client.containerName, task.taskSlug ?? task.id);
-    await client.stop();
-    instances.delete(instanceId);
-    releaseGlobalSlot(instanceId);
-    saveState();
+    await client.close();
   }
 }
 
+/**
+ * Call board-tui set_frontmatter MCP tool.
+ * @param repoDir - Optional repo directory
+ * @param slug - Task card slug
+ * @param key - Frontmatter key
+ * @param value - Frontmatter value
+ */
+export async function setFrontmatter(repoDir: string, slug: string, key: string, value: string): Promise<void> {
+  const client = await spawnBoardTuiClient(repoDir);
+  try {
+    await client.callTool({
+      name: "set_frontmatter",
+      arguments: { slug, key, value },
+    });
+  } finally {
+    await client.close();
+  }
+}
 
-// ---------------------------------------------------------------------------
 // Board-tui delegation scanner
 // ---------------------------------------------------------------------------
 

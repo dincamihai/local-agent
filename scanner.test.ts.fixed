@@ -63,10 +63,12 @@ async function test_spawnBoardTuiClient_starts_subprocess() {
     const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
     const transport = new StdioClientTransport({
       command: "board-tui-mcp",
-      env: {
-        ...process.env,
-        BOARD_TASKS_DIR: tasksDir,
+      env: {...process.env,
+        
         PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+        
+        BOARD_TASKS_DIR: tasksDir,
+        
       },
     });
     await client.connect(transport);
@@ -109,10 +111,12 @@ async function test_listDelegatedTasks_returns_tasks() {
 
       const transport = new StdioClientTransport({
         command: "board-tui-mcp",
-        env: {
-          ...process.env,
+        env: {...process.env,
+          
           PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+          
           BOARD_TASKS_DIR: tasksDir,
+          
         },
       });
       await client.connect(transport);
@@ -173,10 +177,12 @@ async function test_setFrontmatter_updates_card() {
 
       const transport = new StdioClientTransport({
         command: "board-tui-mcp",
-        env: {
-          ...process.env,
+        env: {...process.env,
+          
           PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+          
           BOARD_TASKS_DIR: tasksDir,
+          
         },
       });
       await client.connect(transport);
@@ -226,10 +232,12 @@ async function test_client_closes_cleanly() {
   // Test 1: Explicit close after client creation
   {
     const mockBinDir = createMockWithWrapper();
-    const env = {
-      ...process.env,
+    const env = {...process.env,
+      
       PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+      
       BOARD_TASKS_DIR: tasksDir,
+      
     };
     try {
       const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
@@ -257,10 +265,12 @@ async function test_client_closes_cleanly() {
   // Test 2: Implicit close via list tool call (auto-close in finally)
   {
     const mockBinDir = createMockWithWrapper();
-    const env = {
-      ...process.env,
+    const env = {...process.env,
+      
       PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+      
       BOARD_TASKS_DIR: tasksDir,
+      
     };
     const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
     const transport = new StdioClientTransport({ command: "board-tui-mcp", env });
@@ -283,10 +293,12 @@ async function test_client_closes_cleanly() {
   // Test 3: Multiple sequential close cycles
   for (let i = 0; i < 3; i++) {
     const mockBinDir = createMockWithWrapper();
-    const env = {
-      ...process.env,
+    const env = {...process.env,
+      
       PATH: mockBinDir + path.delimiter + (process.env.PATH ?? ""),
+      
       BOARD_TASKS_DIR: tasksDir,
+      
     };
     try {
       const client = new Client({ name: "pi-bridge-board-tui", version: "1.0.0" });
