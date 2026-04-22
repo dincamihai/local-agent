@@ -2,85 +2,108 @@
 column: Backlog
 ---
 
+---
+column: Backlog
+---
+
 # Remote agent: run pi_bridge on separate machine (AWS ECS)
 
 ## Goal
 
-Enable delegation to work when pi_bridge + podman run on a remote machine (e.g. AWS ECS, remote Linux box) instead of localhost. Claude Code connects via MCP but agent containers run remotely.
+Enable delegation to work when pi_bridge + podman run on a remote machine instead of localhost.
 
-**Local mode preserved** — remote is opt-in. `pi_start` without `repo_url` → current bind-mount behavior unchanged.
+## What is ALREADY DONE
 
-## Problem
+Core remote delegation mode implemented:
 
-Current design assumes pi_bridge runs as local stdio MCP server on same machine as Claude Code:
-- Repo bind-mounted at `/context` (read-only) and `/workspace` (read-write worktree) — impossible remotely
-- Sentinel files written to `/tmp/` — only reachable if local
-- `podman` CLI called directly — must be installed locally
-- Worktrees created at `/tmp/pi-worktrees/` — local path
-- `pi_merge` does local git operations on the worktree
+1. **`pi_start` supports `repo_url` + `repo_branch`** — REMOTE_DELEGATION env mode
+2. **Dockerfile** — git + openssh-client installed
+3. **entrypoint.sh** — clones repo → creates branch → runs pi agent → auto-commits + pushes on exit
+4. **Credential mounts** — podman secret (`gh-token`) + SSH agent socket forwarding
+5. **`pi_start` HTTP transport** — `PI_BRIDGE_HTTP=1 PI_BRIDGE_PORT=3200` for remote MCP connections
+6. **Multi-instance support** — `instances` Map handles concurrent agents
 
-## Key change: container pulls repo with git porcelain
+## Remaining (2 items)
 
-Remote container can't have local paths bind-mounted. Instead:
+### 1. HTTP status endpoint (replacing sentinel files)
 
-### Dockerfile changes
-- Add `git` + credential tooling
-- Inject credentials at runtime (SSH key via secret, or `GIT_TOKEN` env var)
-- Entrypoint script:
-  1. `git clone <REPO_URL> /workspace`
-  2. `git checkout -b pi/<slug>`
-  3. Start pi agent pointing at `/workspace`
+Current: pi-bridge writes `/tmp/<containerName>.status` JSON file on agent_end.
+Remote problem: file only exists on remote host, Claude Code can't read it.
 
-### On agent_end (auto-push)
-After agent finishes, container auto-commits and pushes:
+Change: expose `GET /api/status/<containerName>` on pi-bridge HTTP server:
+```
+GET /api/status/pi-remote-123456
+→ { done: true, error: null, ts: 1234567890 }
+```
+- Store status in-memory Map keyed by containerName
+- Update on `onAgentEnd` callback
+- Poll endpoint from Claude Code instead of `until [ -f /tmp/... ]`
+
+### 2. Remote `pi_merge` strategy
+
+Current: `pi_merge` only knows worktree merge (local mode).
+Remote mode needs git fetch+merge:
 ```sh
-git -C /workspace add -A
-git -C /workspace commit -m "pi: agent changes from pi/<slug>"
-git -C /workspace push origin pi/<slug>
+git fetch origin pi/<branch>
+git merge --no-ff origin/pi/<branch>
+git push origin --delete pi/<branch>  # cleanup
 ```
+- Detect mode from saved state (repo_url present = remote)
+- Branch in `pi_merge` MCP tool handler
 
-### pi_merge on local machine
-No worktree needed. `pi_merge` becomes:
-```sh
-git fetch origin pi/<slug>
-git merge --no-ff origin/pi/<slug>
-git push origin --delete pi/<slug>  # cleanup
-```
-
-## Other changes needed
-
-### 1. Transport: HTTP MCP instead of stdio
-
-pi_bridge already supports HTTP mode (`PI_BRIDGE_HTTP=1 PI_BRIDGE_PORT=3200`). Claude Code connects via `mcp__http` config pointing to remote host.
-
-### 2. Sentinel file → HTTP status endpoint
-
-Replace `/tmp/<name>.status` sentinel with HTTP polling:
-- `pi_bridge` exposes `GET /api/status/<containerName>` returning `{done, error, ts}`
-- Monitor polls the endpoint instead of watching a file
-
-### 3. `podman` → remote container API
-
-Wrap container lifecycle to dispatch to remote Docker API or ECS. Simplest MVP: SSH tunnel to remote Docker socket (`ssh -L /tmp/docker.sock:remote:/var/run/docker.sock`).
-
-## Mode detection in pi_start
+## How it works in AWS ECS
 
 ```
-pi_start(workspace, task)              → local mode (bind-mount, worktree, sentinel file)
-pi_start(repo_url, branch, task)       → remote mode (clone, auto-push, HTTP status)
+┌─────────────────────────────────────────────────────────────┐
+│  AWS ECS Task (Fargate or EC2)                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  pi-bridge MCP server (HTTP mode)                   │    │
+│  │  ┌───────────────────────────────────────────────┐  │    │
+│  │  │  pi agent container (pi-remote-*)               │  │    │
+│  │  │  • git clone REPO_URL /workspace                │  │    │
+│  │  │  • git checkout -b pi/<slug>                    │  │    │
+│  │  │  • runs pi agent with task prompt                │  │    │
+│  │  │  • auto-commit + push on exit                    │  │    │
+│  │  └───────────────────────────────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────┘    │
+│  Port 3200 (PI_BRIDGE_PORT) exposed via ALB / NLB            │
+└─────────────────────────────────────────────────────────────┘
+         ↑
+         │ HTTP MCP (SSE)
+         │
+┌─────────────────────────────────────────────────────────────┐
+│  Local machine (Claude Code)                                │
+│  ~/.claude/settings.json:                                   │
+│  { "mcpServers": {                                          │
+│      "pi-bridge": {                                        │
+│        "url": "https://ecs-task.example.com/mcp"           │
+│      }                                                     │
+│    }                                                       │
+│  }                                                          │
+│  • No podman needed locally                                 │
+│  • No repo bind-mounts                                      │
+│  • pi_merge fetches remote branch instead of worktree       │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-`pi_merge` detects mode from saved state and uses the right merge strategy.
+### ECS-specific notes
 
-## Suggested MVP sequence
+- **Task definition**: 1 container (pi-bridge) with Docker-in-Docker or privileged mode for sibling containers
+- **Networking**: ALB → ECS service on port 3200
+- **Auth**: API key header or VPC-only access (no public internet)
+- **Storage**: EFS for `/tmp/pi-worktrees/` if needed, but remote mode doesn't use worktrees
+- **Credentials**: Secrets Manager → podman secret `gh-token`; or IAM role for CodeCommit
+- **Scaling**: Service auto-scaling on queue depth
 
-1. Dockerfile: add git + auto-push entrypoint script
-2. `pi_start`: add `repo_url` + `branch` params; pass to container as env vars; save mode in state
-3. `pi_merge`: branch on mode — worktree merge (local) vs git fetch+merge (remote)
-4. pi_bridge HTTP mode: add `/api/status/<name>` endpoint
-5. ECS task definition + Claude Code HTTP MCP config
+## Suggested order
+
+1. HTTP status endpoint (`/api/status/<name>`)
+2. Remote `pi_merge` branch
+3. ECS task definition template
+4. Claude Code MCP HTTP config helper
 
 ## Dependencies
 
-- Multi-instance support (`local-agent-pi-bridge-multi-instance`) recommended first
-- Requires git credentials management strategy (SSH deploy key per repo, or token)
+- HTTP transport mode already works (`PI_BRIDGE_HTTP=1`)
+- Multi-instance support already exists
+- Credential strategy (podman secret + SSH agent) already implemented
