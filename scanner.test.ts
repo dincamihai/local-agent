@@ -763,6 +763,42 @@ async function test_processQueueTask_failure() {
   }
 }
 
+// ---- test 13: done/failed tasks persist in queue as audit log ------ --------
+
+async function test_done_failed_tasks_persist_in_queue() {
+  console.log("TEST 13: done/failed tasks persist in queue as audit log");
+  const { openQueue, queueAdd, queueComplete, queueFail, queueGet, queueClaim } = await import("./queue.js");
+
+  const dbDir = makeTempDir("pi-test-audit-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  // Add tasks in various states
+  const doneTask = queueAdd(queueDb, { prompt: "done work", taskSlug: "done-task" });
+  queueComplete(queueDb, doneTask.id, "completed successfully");
+
+  const failedTask = queueAdd(queueDb, { prompt: "fail work", taskSlug: "fail-task" });
+  queueFail(queueDb, failedTask.id, "something broke");
+
+  const queuedTask = queueAdd(queueDb, { prompt: "pending work", taskSlug: "queued-task" });
+
+  // Verify all tasks still in queue
+  assert.equal(queueGet(queueDb, doneTask.id)?.status, "done", "done task should persist");
+  assert.equal(queueGet(queueDb, failedTask.id)?.status, "failed", "failed task should persist");
+  assert.equal(queueGet(queueDb, queuedTask.id)?.status, "queued", "queued task should persist");
+
+  // Verify queueClaim only picks queued tasks (ignores done/failed)
+  const claimed = queueClaim(queueDb, "test-agent");
+  assert.equal(claimed?.taskSlug, "queued-task", "should only claim queued task");
+
+  // Verify done/failed still there after claim
+  assert.equal(queueGet(queueDb, doneTask.id)?.status, "done", "done task still there");
+  assert.equal(queueGet(queueDb, failedTask.id)?.status, "failed", "failed task still there");
+
+  console.log("  PASS — done/failed tasks persist in queue as audit log");
+  cleanup([dbDir]);
+}
+
 // ---- runner ------ ------ ------ ------ -------- ------- ------ --------- -------- ------- --
 
 async function runTests() {
@@ -784,6 +820,7 @@ async function runTests() {
     test_scanner_scans_multiple_dirs,
     test_processQueueTask_success,
     test_processQueueTask_failure,
+    test_done_failed_tasks_persist_in_queue,
   ];
 
   for (const test of tests) {

@@ -101,6 +101,11 @@ export function queueCancel(db: Database.Database, id: string): boolean {
   return info.changes > 0;
 }
 
+export function queueRemove(db: Database.Database, id: string): boolean {
+  const info = db.prepare(`DELETE FROM tasks WHERE id=?`).run(id);
+  return info.changes > 0;
+}
+
 export function queueGet(db: Database.Database, id: string): QueueTask | null {
   const row = db.prepare(`SELECT * FROM tasks WHERE id=?`).get(id) as any;
   return row ? rowToTask(row) : null;
