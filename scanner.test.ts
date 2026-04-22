@@ -623,7 +623,55 @@ async function test_scanner_skips_done_tasks() {
   }
 }
 
-// ---- test 11: processQueueTask success updates queue and card ------ --------
+// ---- test 11: scanner scans multiple BOARD_TASKS_DIRS ------ --------
+
+async function test_scanner_scans_multiple_dirs() {
+  console.log("TEST 11: scanner scans multiple BOARD_TASKS_DIRS");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const { openQueue, queueList } = await import("./queue.js");
+
+  const dirA = makeTempDir("pi-test-scan-a-");
+  const dirB = makeTempDir("pi-test-scan-b-");
+  const mockBinDir = makeTempDir("pi-mock-bin-");
+  const dbDir = makeTempDir("pi-test-db-");
+  const dbPath = path.join(dbDir, "queue.db");
+  const queueDb = openQueue(dbPath);
+
+  writeTaskCard(dirA, "task-from-a", { delegation_status: "queued", column: "Backlog" }, "# Task A\nWork A");
+  writeTaskCard(dirB, "task-from-b", { delegation_status: "queued", column: "Backlog" }, "# Task B\nWork B");
+
+  const mockPath = path.join(mockBinDir, "board-tui-mcp");
+  fs.writeFileSync(mockPath, `#!/bin/sh\nexec node "${MOCK_SCRIPT}" "$@"\n`);
+  fs.chmodSync(mockPath, 0o755);
+
+  const oldPath = process.env.PATH;
+  const oldBoardDir = process.env.BOARD_TASKS_DIR;
+  const oldBoardDirs = process.env.BOARD_TASKS_DIRS;
+  process.env.PATH = mockBinDir + path.delimiter + (oldPath ?? "");
+  process.env.BOARD_TASKS_DIR = dirA;
+  process.env.BOARD_TASKS_DIRS = `${dirA}:${dirB}`;
+
+  try {
+    // Re-import to pick up BOARD_TASKS_DIRS
+    const mod2 = await import("./pi-bridge-mcp.ts?t=" + Date.now());
+    await mod2.scanReposForDelegation(queueDb, dirA);
+    await mod2.scanReposForDelegation(queueDb, dirB);
+
+    const tasks = queueList(queueDb);
+    assert.equal(tasks.length, 2, "should enqueue tasks from both dirs");
+    const slugs = tasks.map((t: any) => t.taskSlug).sort();
+    assert.deepStrictEqual(slugs, ["task-from-a", "task-from-b"], "should find both slugs");
+
+    console.log("  PASS — scanner scans multiple BOARD_TASKS_DIRS");
+  } finally {
+    process.env.PATH = oldPath;
+    process.env.BOARD_TASKS_DIR = oldBoardDir;
+    if (oldBoardDirs === undefined) { delete process.env.BOARD_TASKS_DIRS; } else { process.env.BOARD_TASKS_DIRS = oldBoardDirs; }
+    cleanup([dirA, dirB, mockBinDir, dbDir]);
+  }
+}
+
+// ---- test 12: processQueueTask success updates queue and card ------ --------
 
 async function test_processQueueTask_success() {
   console.log("TEST 11: processQueueTask success updates queue and card");
@@ -733,6 +781,7 @@ async function runTests() {
     test_scanner_finds_queued_task,
     test_scanner_skips_already_enqueued,
     test_scanner_skips_done_tasks,
+    test_scanner_scans_multiple_dirs,
     test_processQueueTask_success,
     test_processQueueTask_failure,
   ];

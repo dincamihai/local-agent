@@ -39,7 +39,7 @@ const GLOBAL_SLOTS_DIR = "/tmp/pi-bridge-slots";
 const PI_DEBUG = process.env.PI_DEBUG === "1";
 const PI_DEBUG_DIR = process.env.PI_DEBUG_DIR ?? "/tmp/pi-bridge-logs";
 const REMOTE_DELEGATION = process.env.REMOTE_DELEGATION === "1";
-const BOARD_TASKS_DIR = process.env.BOARD_TASKS_DIR ?? join(LOCAL_AGENT_DIR, ".tasks");
+const BOARD_TASKS_DIR = process.env.BOARD_TASKS_DIR ?? join(process.cwd(), ".tasks");
 
 function captureContainerLogs(containerName: string, label?: string): void {
   if (!PI_DEBUG) return;
@@ -1530,8 +1530,8 @@ export async function processQueueTask(task: QueueTask, piClient?: PiRpcClient, 
 }
 
 async function workerTick(): Promise<void> {
-  // Scan board-tui for queued delegation tasks (non-blocking)
-  scanReposForDelegation().catch(() => {});
+  // Scan board-tui task dir for queued delegation tasks (non-blocking)
+  scanReposForDelegation(db).catch(() => {});
 
   // Cheap local check first — avoids touching the slot dir every 5s when busy
   if (instances.size >= PARALLEL_LIMIT) return;
