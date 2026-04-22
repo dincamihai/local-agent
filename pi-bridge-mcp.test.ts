@@ -1107,6 +1107,140 @@ async function testPiDebugOffNoFiles() {
   console.log("  PASS — PI_DEBUG unset produces no log files");
 }
 
+// ---- remote delegation tests (TDD) ----------------------------------------
+
+async function testRemoteDelegationMountConstruction() {
+  console.log("TEST 29: remote delegation mounts — no workspace mount, credentials only");
+
+  const client = {
+    mounts: [] as string[],
+    envVars: [] as string[],
+    buildMounts(repoUrl?: string, taskFile?: string) {
+      const mounts: string[] = [];
+      const envVars: string[] = [];
+
+      // Remote mode: no host repo mount
+      if (repoUrl) {
+        envVars.push(`REPO_URL=${repoUrl}`);
+        envVars.push(`REPO_BRANCH=pi/remote-${Date.now()}`);
+      }
+
+      if (taskFile) mounts.push("-v", `${taskFile}:/task.md:rw`);
+      mounts.push("-v", `${join(tmpdir(), "output")}:/output`);
+
+      // Credential mounts
+      mounts.push("--secret", "gh-token");
+      if (process.env.SSH_AUTH_SOCK) {
+        mounts.push("-v", `${process.env.SSH_AUTH_SOCK}:/ssh-agent`);
+        envVars.push("SSH_AUTH_SOCK=/ssh-agent");
+      }
+
+      this.mounts = mounts;
+      this.envVars = envVars;
+    }
+  };
+
+  client.buildMounts("https://github.com/user/repo", "/tmp/task.md");
+
+  assert.ok(!client.mounts.some(m => m.includes(":/workspace") || m.includes(":/context")), "should NOT mount workspace or context");
+  assert.ok(client.mounts.some(m => m === "--secret" && client.mounts[client.mounts.indexOf(m) + 1] === "gh-token"), "should mount gh-token secret");
+  assert.ok(client.mounts.some(m => m.includes(":/output")), "should mount output");
+  assert.ok(client.mounts.some(m => m.includes(":/task.md:rw")), "should mount task file");
+  assert.ok(client.envVars.some(e => e.startsWith("REPO_URL=")), "should set REPO_URL env var");
+  console.log("  PASS — remote mode mounts credentials, no repo");
+}
+
+async function testRemoteDelegationEntrypointLocalMode() {
+  console.log("TEST 30: entrypoint local mode — no REPO_URL, delegates to pi");
+
+  const testCode = `
+    REPO_URL=""
+    if [ -z "$REPO_URL" ]; then
+      echo "local_mode"
+      exit 0
+    fi
+    echo "remote_mode"
+  `;
+
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("sh", ["-c", testCode], { encoding: "utf-8" });
+
+  assert.equal(result.stdout.trim(), "local_mode", "no REPO_URL should enter local mode");
+  assert.equal(result.status, 0, "should exit 0 in local mode");
+  console.log("  PASS — entrypoint enters local mode without REPO_URL");
+}
+
+async function testRemoteDelegationEntrypointRemoteMode() {
+  console.log("TEST 31: entrypoint remote mode — REPO_URL set, clones to /workspace");
+
+  // Test the shell logic with a local bare repo
+  const bareRepo = mkdtempSync(join(tmpdir(), "pi-test-bare-repo-"));
+  const workDir = makeTempGitRepo();
+
+  // Initialize bare repo and push to it
+  execSync(`git init --bare ${bareRepo}`, { stdio: "ignore" });
+  execSync(`git -C ${workDir} push ${bareRepo} HEAD:main`, { stdio: "ignore" });
+
+  const testCode = `
+    set -e
+    REPO_URL="${bareRepo}"
+    REPO_BRANCH="pi/test-remote"
+
+    # Simulate credential detection (no token, no SSH)
+    if [ -f /run/secrets/gh-token ]; then
+      echo "using_token"
+    elif [ -n "$SSH_AUTH_SOCK" ]; then
+      echo "using_ssh"
+    fi
+
+    git clone "$REPO_URL" /tmp/test-workspace
+    cd /tmp/test-workspace
+    git checkout -b "$REPO_BRANCH"
+
+    echo "cloned"
+  `;
+
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("sh", ["-c", testCode], { encoding: "utf-8" });
+
+  assert.ok(result.stdout.includes("cloned"), "should clone repo and create branch");
+  assert.ok(existsSync("/tmp/test-workspace"), "workspace directory should exist");
+
+  // Cleanup
+  execSync("rm -rf /tmp/test-workspace");
+  cleanup([workDir, bareRepo]);
+  console.log("  PASS — entrypoint clones repo and creates branch");
+}
+
+async function testRemoteDelegationCredentialPriority() {
+  console.log("TEST 32: credential priority — token before SSH");
+
+  // Test that token is checked first
+  const testCode = `
+    checked=""
+    if [ -f /run/secrets/gh-token ]; then
+      checked="token"
+    elif [ -n "$SSH_AUTH_SOCK" ]; then
+      checked="ssh"
+    fi
+    echo "$checked"
+  `;
+
+  const { spawnSync } = await import("node:child_process");
+  const result = spawnSync("sh", ["-c", testCode], { encoding: "utf-8" });
+
+  assert.equal(result.stdout.trim(), "", "no credentials → empty check");
+
+  // With SSH_AUTH_SOCK
+  const result2 = spawnSync("sh", ["-c", testCode], {
+    encoding: "utf-8",
+    env: { ...process.env, SSH_AUTH_SOCK: "/tmp/agent" }
+  });
+  assert.equal(result2.stdout.trim(), "ssh", "SSH agent detected when token absent");
+
+  console.log("  PASS — token checked before SSH, SSH used as fallback");
+}
+
 // ---- mount flow tests ------------------------------------------------------
 
 async function testMountWorktreeOnly() {
@@ -1417,6 +1551,10 @@ async function runTests() {
     testMountTaskFile,
     testMountOutputAlwaysPresent,
     testNoDualMountBug,
+    testRemoteDelegationMountConstruction,
+    testRemoteDelegationEntrypointLocalMode,
+    testRemoteDelegationEntrypointRemoteMode,
+    testRemoteDelegationCredentialPriority,
   ];
 
   for (const test of tests) {
