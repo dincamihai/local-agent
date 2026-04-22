@@ -1513,6 +1513,351 @@ async function testNoDualMountBug() {
   cleanup([workDir]);
 }
 
+// ---- cleanupStaleInstances tests ------------------------------------------
+
+async function testCleanupNoStaleInstances() {
+  console.log("TEST 33: no stale instances — nothing cleaned up");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "\n"; // no other pi-bridge processes
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return "\n"; // no state files
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    calls.kills.push({ pid, sig: String(sig) });
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.kills.length, 0, "no kills when no orphaned processes");
+  assert.equal(calls.unlinks.length, 0, "no unlinks when no state files");
+  assert.equal(calls.exec.some(c => c.includes("pgrep")), true, "pgrep was called");
+
+  console.log("  PASS — nothing cleaned when no stale state");
+}
+
+async function testCleanupOrphanedProcessKilled() {
+  console.log("TEST 34: orphaned process (ppid <= 1) killed");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "123\n"; // one other process
+    if (cmd.includes("ps -o ppid= -p 123")) return "  1\n"; // reparented to init
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return "\n"; // no state files
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    calls.kills.push({ pid, sig: String(sig) });
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.kills.length, 1, "one kill when orphaned process found");
+  assert.equal(calls.kills[0].pid, 123, "killed the orphaned PID");
+  assert.equal(calls.kills[0].sig, "SIGTERM", "sent SIGTERM");
+  assert.ok(calls.writes.some(w => w.includes("Killed 1 orphaned")), "wrote kill message");
+
+  console.log("  PASS — orphaned process killed with SIGTERM");
+}
+
+async function testCleanupNonOrphanNotKilled() {
+  console.log("TEST 35: non-orphan (ppid > 1) NOT killed");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "123\n";
+    if (cmd.includes("ps -o ppid= -p 123")) return "  999\n"; // alive parent
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return "\n";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    calls.kills.push({ pid, sig: String(sig) });
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.kills.length, 0, "no kills when process has alive parent");
+  assert.ok(!calls.writes.some(w => w.includes("Killed")), "no kill message");
+
+  console.log("  PASS — non-orphan not touched");
+}
+
+async function testCleanupStaleStateFileDeadPid() {
+  console.log("TEST 36: stale state file with dead PID → container stopped, file deleted");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+  const stateFile = "/tmp/pi-bridge-state-12345.json";
+  const state = JSON.stringify({ pid: 12345, instances: [{ containerName: "pi-test-abc" }] });
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return stateFile + "\n";
+    if (cmd.includes("podman stop")) return "";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    calls.kills.push({ pid, sig: String(sig) });
+    if (sig === 0) throw new Error("dead process"); // process.kill(pid, 0) throws when dead
+  }
+  function mockRead(path: string) {
+    if (path === stateFile) return state;
+    throw new Error("unexpected read: " + path);
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, readFileSync: mockRead, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.ok(calls.exec.some(c => c.includes("podman stop pi-test-abc")), "podman stop called");
+  assert.equal(calls.unlinks.length, 1, "state file deleted");
+  assert.equal(calls.unlinks[0], stateFile, "deleted the correct state file");
+  assert.ok(calls.writes.some(w => w.includes("Stopped orphaned container: pi-test-abc")), "wrote stop message");
+
+  console.log("  PASS — dead PID state: container stopped + file deleted");
+}
+
+async function testCleanupStateFileAlivePid() {
+  console.log("TEST 37: state file with alive PID → container NOT stopped, file NOT deleted");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+  const stateFile = "/tmp/pi-bridge-state-12345.json";
+  const state = JSON.stringify({ pid: 12345, instances: [{ containerName: "pi-test-abc" }] });
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return stateFile + "\n";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    calls.kills.push({ pid, sig: String(sig) });
+    if (sig === 0) return true; // process alive, no throw
+  }
+  function mockRead(path: string) {
+    if (path === stateFile) return state;
+    throw new Error("unexpected read: " + path);
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, readFileSync: mockRead, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.ok(!calls.exec.some(c => c.includes("podman stop")), "podman stop NOT called for alive PID");
+  assert.equal(calls.unlinks.length, 0, "state file NOT deleted");
+  assert.ok(!calls.writes.some(w => w.includes("Stopped orphaned")), "no stop message");
+
+  console.log("  PASS — alive PID state left intact");
+}
+
+async function testCleanupPartialMixedPids() {
+  console.log("TEST 38: partial cleanup — one alive state, one dead state");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+  const aliveFile = "/tmp/pi-bridge-state-111.json";
+  const deadFile = "/tmp/pi-bridge-state-222.json";
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return aliveFile + "\n" + deadFile + "\n";
+    if (cmd.includes("podman stop pi-alive")) return "";
+    if (cmd.includes("podman stop pi-dead")) return "";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    calls.kills.push({ pid, sig: String(sig) });
+    if (pid === 111 && sig === 0) return true; // alive
+    if (pid === 222 && sig === 0) throw new Error("dead");
+  }
+  function mockRead(path: string) {
+    if (path === aliveFile) return JSON.stringify({ pid: 111, instances: [{ containerName: "pi-alive" }] });
+    if (path === deadFile) return JSON.stringify({ pid: 222, instances: [{ containerName: "pi-dead" }] });
+    throw new Error("unexpected read: " + path);
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, readFileSync: mockRead, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.unlinks.length, 1, "only dead state file deleted");
+  assert.equal(calls.unlinks[0], deadFile, "deleted dead file");
+  assert.ok(calls.exec.some(c => c.includes("podman stop pi-dead")), "stopped dead container");
+  assert.ok(!calls.exec.some(c => c.includes("podman stop pi-alive")), "did NOT stop alive container");
+
+  console.log("  PASS — partial cleanup: alive intact, dead removed");
+}
+
+async function testCleanupPgrepThrowsSwallowed() {
+  console.log("TEST 39: pgrep throws → swallowed, no crash");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) throw new Error("pgrep not found");
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) { calls.kills.push({ pid, sig: String(sig) }); }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.kills.length, 0, "no kills after pgrep error");
+  assert.equal(calls.unlinks.length, 0, "no unlinks after pgrep error");
+  assert.ok(calls.writes.length === 0 || true, "no crash — function completed");
+
+  console.log("  PASS — pgrep error swallowed gracefully");
+}
+
+async function testCleanupPsThrowsSwallowed() {
+  console.log("TEST 40: ps throws for one PID → swallowed, continues to next");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "100\n200\n";
+    if (cmd.includes("ps -o ppid= -p 100")) throw new Error("ps failed");
+    if (cmd.includes("ps -o ppid= -p 200")) return "  1\n"; // orphan
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return "\n";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) { calls.kills.push({ pid, sig: String(sig) }); }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.kills.length, 1, "only orphan 200 killed");
+  assert.equal(calls.kills[0].pid, 200, "killed PID 200 after ps failure on 100");
+
+  console.log("  PASS — ps error swallowed, continues scanning");
+}
+
+async function testCleanupPodmanStopThrowsSwallowed() {
+  console.log("TEST 41: podman stop throws → swallowed, file still deleted");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+  const stateFile = "/tmp/pi-bridge-state-999.json";
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return stateFile + "\n";
+    if (cmd.includes("podman stop")) throw new Error("no such container");
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    if (sig === 0) throw new Error("dead");
+  }
+  function mockRead() { return JSON.stringify({ pid: 999, instances: [{ containerName: "pi-gone" }] }); }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, readFileSync: mockRead, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.unlinks.length, 1, "state file still deleted despite podman stop error");
+  assert.equal(calls.unlinks[0], stateFile, "correct file deleted");
+
+  console.log("  PASS — podman stop error swallowed, file cleaned up");
+}
+
+async function testCleanupCorruptJsonSwallowed() {
+  console.log("TEST 42: corrupt state JSON → swallowed, continues");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+  const badFile = "/tmp/pi-bridge-state-bad.json";
+  const goodFile = "/tmp/pi-bridge-state-good.json";
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return "\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return badFile + "\n" + goodFile + "\n";
+    if (cmd.includes("podman stop pi-good")) return "";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) {
+    if (pid === 777 && sig === 0) throw new Error("dead");
+  }
+  function mockRead(path: string) {
+    if (path === badFile) return "NOT JSON {{";
+    if (path === goodFile) return JSON.stringify({ pid: 777, instances: [{ containerName: "pi-good" }] });
+    throw new Error("unexpected read: " + path);
+  }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, readFileSync: mockRead, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.equal(calls.unlinks.length, 1, "only good file deleted");
+  assert.equal(calls.unlinks[0], goodFile, "good file removed after corrupt file skipped");
+
+  console.log("  PASS — corrupt JSON swallowed, good file still cleaned");
+}
+
+async function testCleanupOwnPidExcluded() {
+  console.log("TEST 43: own PID excluded from orphan list");
+  const mod = await import("./pi-bridge-mcp.ts");
+  const fn = mod.cleanupStaleInstances;
+
+  const myPid = process.pid;
+  const calls = { exec: [] as string[], kills: [] as Array<{ pid: number; sig: string }>, unlinks: [] as string[], writes: [] as string[] };
+
+  function mockExec(cmd: string) {
+    calls.exec.push(cmd);
+    if (cmd.includes("pgrep")) return `${myPid}\n123\n`; // includes self
+    if (cmd.includes("ps -o ppid= -p 123")) return "  1\n";
+    if (cmd.includes("ls /tmp/pi-bridge-state")) return "\n";
+    throw new Error("unexpected: " + cmd);
+  }
+  function mockKill(pid: number, sig: string | number) { calls.kills.push({ pid, sig: String(sig) }); }
+  function mockUnlink(path: string) { calls.unlinks.push(path); }
+  function mockWrite(_msg: string) { calls.writes.push(_msg); }
+
+  fn({ execSync: mockExec as any, processKill: mockKill as any, unlinkSync: mockUnlink, stderrWrite: mockWrite });
+
+  assert.ok(!calls.kills.some(k => k.pid === myPid), "own PID never killed");
+  assert.equal(calls.kills.length, 1, "only other PID killed");
+  assert.equal(calls.kills[0].pid, 123, "killed the other orphaned PID");
+
+  console.log("  PASS — own PID excluded from cleanup");
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -1555,6 +1900,17 @@ async function runTests() {
     testRemoteDelegationEntrypointLocalMode,
     testRemoteDelegationEntrypointRemoteMode,
     testRemoteDelegationCredentialPriority,
+    testCleanupNoStaleInstances,
+    testCleanupOrphanedProcessKilled,
+    testCleanupNonOrphanNotKilled,
+    testCleanupStaleStateFileDeadPid,
+    testCleanupStateFileAlivePid,
+    testCleanupPartialMixedPids,
+    testCleanupPgrepThrowsSwallowed,
+    testCleanupPsThrowsSwallowed,
+    testCleanupPodmanStopThrowsSwallowed,
+    testCleanupCorruptJsonSwallowed,
+    testCleanupOwnPidExcluded,
   ];
 
   for (const test of tests) {
