@@ -1,7 +1,8 @@
 ---
-column: Backlog
+column: Done
 parent: local-agent-remote-execution
 part: 1/4
+updated: true
 ---
 
 # Remote agent: Dockerfile git + entrypoint script
