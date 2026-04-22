@@ -1,7 +1,6 @@
 ---
 column: Done
 title: local-agent: add REPO_DIRS config and frontmatter parser
-updated: true
 ---
 
 # local-agent: add MCP client to talk to board-tui
@@ -30,3 +29,8 @@ Write tests BEFORE implementation:
 - `local-agent/scanner.test.ts`
 
 ## Result
+
+- Implemented `spawnBoardTuiClient(repoDir)`, `listDelegatedTasks(repoDir, status)`, `setFrontmatter(repoDir, slug, key, value)` in `pi-bridge-mcp.ts`
+- Updated `mock-board-tui-tests.js` with proper MCP initialize handshake and disk writes
+- `scanner.test.ts` has 4 tests covering all wrappers — all pass
+- All test suites pass: scanner 12/12, queue 14/14, pi-bridge 34/34
