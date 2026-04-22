@@ -10,25 +10,15 @@ updated: true
 
 Show delegation status in board-tui task cards.
 
-## UI changes
+## Subtasks
 
-- New frontmatter field: `delegation_status: queued|processing|done`
-- Display badge/prefix in list:
-  - `⏳ task` - queued
-  - `▶ task (agent-1)` - processing
-  - `✓ task` - done
-- Detail panel shows:
-  - Queue position
-  - Agent name
-  - Started/completed timestamps
-  - Result output
-
-## Key bindings
-
-- `d` - delegate selected task (add to queue)
-- `D` - show delegation status
+- `delegation-queue-ui-badges` — UI badges for task cards (frontmatter + list/detail rendering)
+- `delegation-queue-keybinding-d` — `d` keybinding to delegate selected task
+- `delegation-queue-keybinding-D` — `D` keybinding to remove task from queue
 
 ## MCP tools for board-tui
 
-- `queue_task(slug)` - add task to delegation queue
-- `delegation_status(slug)` - get queue status for task
+- `queue_task(slug)` — add task to delegation queue
+- `delegation_status(slug)` — get queue status for task
+
+## Result
