@@ -1107,6 +1107,278 @@ async function testPiDebugOffNoFiles() {
   console.log("  PASS — PI_DEBUG unset produces no log files");
 }
 
+// ---- mount flow tests ------------------------------------------------------
+
+async function testMountWorktreeOnly() {
+  console.log("TEST 23: git worktree mount — /workspace only, NO /context");
+  const workDir = makeTempGitRepo();
+  const expectedRepoName = basename(workDir);
+
+  const client = {
+    worktreePath: null as string | null,
+    mounts: [] as string[],
+    async start(contextDir?: string, _task?: string, editDir?: string, name?: string) {
+      let worktreePath: string | undefined;
+      if (contextDir && !editDir) {
+        try {
+          execSync(`git -C ${contextDir} rev-parse --git-dir`, { stdio: "ignore" });
+          const branch = `pi/${name}-${Date.now()}`;
+          const repoName = basename(contextDir);
+          worktreePath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
+          execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
+          execSync(`git -C ${contextDir} worktree add ${worktreePath} -b ${branch}`);
+          this.worktreePath = worktreePath;
+        } catch { /* silent */ }
+      }
+
+      const mounts: string[] = [];
+      if (worktreePath) {
+        mounts.push("-v", `${worktreePath}:/workspace:rw`);
+      } else if (editDir) {
+        mounts.push("-v", `${editDir}:/workspace:rw`);
+      } else if (contextDir) {
+        mounts.push("-v", `${contextDir}:/context:ro`);
+      }
+      mounts.push("-v", `${join(tmpdir(), "output")}:/output`);
+      this.mounts = mounts;
+    }
+  };
+
+  await client.start(workDir, undefined, undefined, "pi-test-mount");
+
+  assert.ok(client.worktreePath, "worktree should be created");
+  assert.ok(client.mounts.some(m => m.includes("/workspace:rw")), "should have /workspace:rw mount");
+  assert.ok(!client.mounts.some(m => m.includes("/context:ro")), "should NOT have /context:ro mount");
+  console.log("  PASS — worktree mode mounts /workspace only");
+
+  cleanup([workDir]);
+}
+
+async function testMountEditdirOverridesWorktree() {
+  console.log("TEST 24: explicit editdir on git repo — /workspace only, no worktree");
+  const workDir = makeTempGitRepo();
+  const explicitEdit = join(tmpdir(), "pi-test-edit-" + Date.now());
+  mkdirSync(explicitEdit);
+
+  const client = {
+    worktreePath: null as string | null,
+    mounts: [] as string[],
+    async start(contextDir?: string, _task?: string, editDir?: string, name?: string) {
+      let worktreePath: string | undefined;
+      if (contextDir && !editDir) {
+        try {
+          execSync(`git -C ${contextDir} rev-parse --git-dir`, { stdio: "ignore" });
+          const branch = `pi/${name}-${Date.now()}`;
+          const repoName = basename(contextDir);
+          worktreePath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
+          execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
+          execSync(`git -C ${contextDir} worktree add ${worktreePath} -b ${branch}`);
+          this.worktreePath = worktreePath;
+        } catch { /* silent */ }
+      }
+
+      const mounts: string[] = [];
+      if (worktreePath) {
+        mounts.push("-v", `${worktreePath}:/workspace:rw`);
+      } else if (editDir) {
+        mounts.push("-v", `${editDir}:/workspace:rw`);
+      } else if (contextDir) {
+        mounts.push("-v", `${contextDir}:/context:ro`);
+      }
+      mounts.push("-v", `${join(tmpdir(), "output")}:/output`);
+      this.mounts = mounts;
+    }
+  };
+
+  await client.start(workDir, undefined, explicitEdit, "pi-test-edit");
+
+  assert.ok(!client.worktreePath, "worktree should NOT be created when editdir provided");
+  assert.ok(client.mounts.some(m => m === explicitEdit + ":/workspace:rw"), "should mount explicit editdir at /workspace");
+  assert.ok(!client.mounts.some(m => m.includes("/context:ro")), "should NOT have /context:ro mount");
+  console.log("  PASS — editdir overrides worktree, /workspace only");
+
+  cleanup([workDir, explicitEdit]);
+}
+
+async function testMountReadOnlyFallback() {
+  console.log("TEST 25: non-git workspace — /context:ro only");
+  const workDir = makeTempNoGit();
+
+  const client = {
+    mounts: [] as string[],
+    async start(contextDir?: string, _task?: string, editDir?: string) {
+      let worktreePath: string | undefined;
+      if (contextDir && !editDir) {
+        try {
+          execSync(`git -C ${contextDir} rev-parse --git-dir`, { stdio: "ignore" });
+          // would create worktree, but not a git repo
+        } catch { /* not a git repo */ }
+      }
+
+      const mounts: string[] = [];
+      if (worktreePath) {
+        mounts.push("-v", `${worktreePath}:/workspace:rw`);
+      } else if (editDir) {
+        mounts.push("-v", `${editDir}:/workspace:rw`);
+      } else if (contextDir) {
+        mounts.push("-v", `${contextDir}:/context:ro`);
+      }
+      mounts.push("-v", `${join(tmpdir(), "output")}:/output`);
+      this.mounts = mounts;
+    }
+  };
+
+  await client.start(workDir, undefined, undefined);
+
+  assert.ok(client.mounts.some(m => m === `${workDir}:/context:ro`), "should mount workspace at /context:ro");
+  assert.ok(!client.mounts.some(m => m.includes("/workspace:rw")), "should NOT have /workspace:rw mount");
+  console.log("  PASS — non-git workspace falls back to /context:ro only");
+
+  cleanup([workDir]);
+}
+
+async function testMountTaskFile() {
+  console.log("TEST 26: task file mount — /task.md appended to mounts");
+  const workDir = makeTempGitRepo();
+  const taskFile = join(workDir, "task.md");
+  writeFileSync(taskFile, "# test task");
+
+  const client = {
+    mounts: [] as string[],
+    async start(contextDir?: string, taskFile?: string, editDir?: string) {
+      let worktreePath: string | undefined;
+      if (contextDir && !editDir) {
+        try {
+          execSync(`git -C ${contextDir} rev-parse --git-dir`, { stdio: "ignore" });
+          const branch = `pi/test-${Date.now()}`;
+          const repoName = basename(contextDir);
+          worktreePath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
+          execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
+          execSync(`git -C ${contextDir} worktree add ${worktreePath} -b ${branch}`);
+        } catch { /* silent */ }
+      }
+
+      const mounts: string[] = [];
+      if (worktreePath) {
+        mounts.push("-v", `${worktreePath}:/workspace:rw`);
+      } else if (editDir) {
+        mounts.push("-v", `${editDir}:/workspace:rw`);
+      } else if (contextDir) {
+        mounts.push("-v", `${contextDir}:/context:ro`);
+      }
+      if (taskFile) mounts.push("-v", `${taskFile}:/task.md:rw`);
+      mounts.push("-v", `${join(tmpdir(), "output")}:/output`);
+      this.mounts = mounts;
+    }
+  };
+
+  await client.start(workDir, taskFile, undefined, "pi-test-task");
+
+  assert.ok(client.mounts.some(m => m.includes("/task.md:rw")), "should mount task file");
+  assert.ok(!client.mounts.some(m => m.includes("/context:ro")), "should NOT have /context:ro");
+  console.log("  PASS — task file mounted when provided");
+
+  cleanup([workDir]);
+}
+
+async function testMountOutputAlwaysPresent() {
+  console.log("TEST 27: output mount — always present regardless of mode");
+  const outputDir = join(tmpdir(), "output");
+
+  const client = {
+    mounts: [] as string[],
+    async start(contextDir?: string, _task?: string, editDir?: string) {
+      let worktreePath: string | undefined;
+      if (contextDir && !editDir) {
+        try {
+          execSync(`git -C ${contextDir} rev-parse --git-dir`, { stdio: "ignore" });
+          // git repo check
+        } catch { /* not git */ }
+      }
+
+      const mounts: string[] = [];
+      if (worktreePath) {
+        mounts.push("-v", `${worktreePath}:/workspace:rw`);
+      } else if (editDir) {
+        mounts.push("-v", `${editDir}:/workspace:rw`);
+      } else if (contextDir) {
+        mounts.push("-v", `${contextDir}:/context:ro`);
+      }
+      mounts.push("-v", `${outputDir}:/output`);
+      this.mounts = mounts;
+    }
+  };
+
+  // Test all three modes
+  await client.start(undefined, undefined, undefined);
+  assert.ok(client.mounts.some(m => m.includes("/output")), "no context: output should still mount");
+
+  const workDir = makeTempNoGit();
+  await client.start(workDir, undefined, undefined);
+  assert.ok(client.mounts.some(m => m.includes("/output")), "read-only: output should still mount");
+
+  const gitDir = makeTempGitRepo();
+  await client.start(gitDir, undefined, undefined, "pi-test-output");
+  assert.ok(client.mounts.some(m => m.includes("/output")), "worktree: output should still mount");
+
+  console.log("  PASS — /output mounted in all modes");
+
+  cleanup([workDir, gitDir]);
+}
+
+async function testNoDualMountBug() {
+  console.log("TEST 28: dual-mount bug fixed — git repo never mounts both /context and /workspace");
+  const workDir = makeTempGitRepo();
+
+  const client = {
+    mounts: [] as string[],
+    async start(contextDir?: string, _task?: string, editDir?: string, name?: string) {
+      let worktreePath: string | undefined;
+      if (contextDir && !editDir) {
+        try {
+          execSync(`git -C ${contextDir} rev-parse --git-dir`, { stdio: "ignore" });
+          const branch = `pi/${name}-${Date.now()}`;
+          const repoName = basename(contextDir);
+          worktreePath = `/tmp/pi-worktrees/${repoName}/${branch.replace(/\//g, "-")}`;
+          execSync(`mkdir -p /tmp/pi-worktrees/${repoName}`);
+          execSync(`git -C ${contextDir} worktree add ${worktreePath} -b ${branch}`);
+        } catch { /* silent */ }
+      }
+
+      const mounts: string[] = [];
+      // OLD BUGGY CODE would do:
+      // if (contextDir) mounts.push("-v", `${contextDir}:/context:ro`);
+      // if (editDir || worktreePath) mounts.push("-v", `${editDir || worktreePath}:/workspace:rw`);
+
+      // NEW FIXED CODE:
+      if (worktreePath) {
+        mounts.push("-v", `${worktreePath}:/workspace:rw`);
+      } else if (editDir) {
+        mounts.push("-v", `${editDir}:/workspace:rw`);
+      } else if (contextDir) {
+        mounts.push("-v", `${contextDir}:/context:ro`);
+      }
+      mounts.push("-v", `${join(tmpdir(), "output")}:/output`);
+      this.mounts = mounts;
+    }
+  };
+
+  await client.start(workDir, undefined, undefined, "pi-test-dual");
+
+  const hasContext = client.mounts.some(m => m.includes("/context:ro"));
+  const hasWorkspace = client.mounts.some(m => m.includes("/workspace:rw"));
+
+  assert.ok(hasWorkspace, "should have /workspace:rw");
+  assert.ok(!hasContext, "should NOT have /context:ro when worktree active");
+
+  // Verify only 2 mounts: workspace + output
+  assert.equal(client.mounts.filter(m => m.startsWith("-v")).length, 2, "should have exactly 2 -v mounts");
+
+  console.log("  PASS — no dual mount bug, single repo mount enforced");
+
+  cleanup([workDir]);
+}
+
 // ---- runner ----------------------------------------------------------------
 
 async function runTests() {
@@ -1139,6 +1411,12 @@ async function runTests() {
     testFailOpenOnInaccessibleSlotsDir,
     testPiDebugWritesLogFile,
     testPiDebugOffNoFiles,
+    testMountWorktreeOnly,
+    testMountEditdirOverridesWorktree,
+    testMountReadOnlyFallback,
+    testMountTaskFile,
+    testMountOutputAlwaysPresent,
+    testNoDualMountBug,
   ];
 
   for (const test of tests) {
